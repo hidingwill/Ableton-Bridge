@@ -235,13 +235,13 @@ MCP stdio connections are process-private: clients such as Codex may launch one 
 | First normal tool call | Atomically binds loopback port `9881`, starts the backend resources, and becomes `owner`. |
 | Another process already owns `9881` | Remains healthy in `standby`; tools return a structured ownership error instead of terminating MCP initialization. |
 | Status call | `get_server_capabilities` reports `control_role`, `control_availability`, active operations, and best-effort owner process/task metadata without claiming control. |
-| Explicit release | `release_ableton_control` stops owner resources, then closes `9881`; a standby process can claim on its next normal tool call. |
+| Explicit release | `release_ableton_control` closes `9881` only after every owner resource has stopped; incomplete cleanup returns `released: false` and retains ownership for a safe retry. |
 | MCP shutdown | Performs the same release automatically. |
-| Backend startup fails | Cleans up partial resources and releases `9881` so a later call can retry. |
+| Backend startup fails | Cleans up partial resources and releases `9881` only after cleanup is confirmed; otherwise ownership is retained until release can be retried safely. |
 
 The `9881` owner socket also serves a loopback-only JSON status response. Reusing the lock socket avoids a stale metadata file or another management port. If an unrelated process occupies the port, availability is reported as `occupied_unknown`.
 
-Ownership has no idle timeout and cannot be stolen. Manual release is refused while a tool thread or owner background operation is still active, including work that outlived the MCP tool timeout. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
+Ownership has no idle timeout and cannot be stolen. Manual release is refused while a tool thread or owner background operation is still active, including work that outlived the MCP tool timeout. Forced shutdown signals cooperative cancellation, retains live thread and connection state after a join timeout, and keeps port `9881` until a later cleanup pass confirms that every owner resource stopped. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
 
 ## Command Delay Tiers
 
@@ -272,8 +272,8 @@ Defined in `instructions.py` and passed to `FastMCP(instructions=...)`. Automati
 
 ### Tools (347 core + 19 optional ElevenLabs)
 All tools use the `@_tool_handler` decorator which:
-1. Gates execution via `asyncio.Semaphore(1)` — only one tool runs at a time, preventing thread pool exhaustion and TCP socket corruption
-2. Automatically claims Ableton control for normal tools; status and release are explicitly exempt
+1. Gates owner-dependent execution via `asyncio.Semaphore(1)` to prevent TCP socket corruption; claim-free status and release remain available as recovery paths
+2. Automatically claims Ableton control for normal tools with a bounded wait; status and release are explicitly exempt
 3. Wraps sync functions in `asyncio.to_thread()` for non-blocking execution
 4. Tracks the real worker lifetime even after an async timeout, preventing unsafe release
 5. Enforces a 120-second timeout via `asyncio.wait_for()`

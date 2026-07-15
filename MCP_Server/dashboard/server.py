@@ -190,24 +190,40 @@ def start_dashboard_server():
     logger.info("Dashboard started at http://127.0.0.1:%d", state.DASHBOARD_PORT)
 
 
-def stop_dashboard_server():
-    """Signal the dashboard server to shut down."""
+def stop_dashboard_server() -> bool:
+    """Signal shutdown and report whether the dashboard thread has exited."""
     server = state.dashboard_server
     thread = state.dashboard_thread
     if server:
         server.should_exit = True
-    if thread and thread is not threading.current_thread():
+    stopped = True
+    if thread is threading.current_thread():
+        stopped = False
+    elif thread:
         # Teardown may overlap the narrow window after the thread is
         # published to shared state but before start() runs.  join() raises
         # RuntimeError for an unstarted thread, so keep cleanup best-effort.
-        if thread.ident is not None:
+        if thread.ident is None:
+            stopped = False
+        else:
             try:
                 thread.join(timeout=3.0)
             except RuntimeError as exc:
                 logger.warning("Could not join dashboard thread: %s", exc)
+                stopped = False
+            else:
+                stopped = not thread.is_alive()
+
+    if not stopped:
+        logger.warning(
+            "Dashboard shutdown is incomplete; retaining server and thread state"
+        )
+        return False
+
     if state.dashboard_server is server:
         state.dashboard_server = None
     if state.dashboard_thread is thread:
         state.dashboard_thread = None
     if server or thread:
         logger.info("Dashboard server stopped")
+    return True

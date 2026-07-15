@@ -129,6 +129,135 @@ def test_backend_start_failure_releases_port(unused_tcp_port):
         replacement.shutdown()
 
 
+def test_failed_start_retains_port_until_partial_cleanup_finishes(unused_tcp_port):
+    cleanup_ready = {"value": False}
+
+    def fail_start():
+        raise RuntimeError("Live unavailable")
+
+    failing = _configured_manager(
+        unused_tcp_port,
+        start=fail_start,
+        stop=lambda: cleanup_ready["value"],
+    )
+    replacement = _configured_manager(unused_tcp_port)
+    try:
+        result = failing.ensure_control()
+        assert result.acquired is False
+        assert "ownership was retained" in result.error
+        assert result.control["control_role"] == "owner"
+        assert replacement.ensure_control().acquired is False
+
+        cleanup_ready["value"] = True
+        assert failing.release().released is True
+        assert replacement.ensure_control().acquired is True
+    finally:
+        cleanup_ready["value"] = True
+        failing.shutdown()
+        replacement.shutdown()
+
+
+def test_startup_and_shutdown_transitions_are_serialized(unused_tcp_port):
+    start_entered = threading.Event()
+    allow_start = threading.Event()
+    shutdown_entered = threading.Event()
+    shutdown_done = threading.Event()
+    claims = []
+    stops = []
+
+    def start():
+        start_entered.set()
+        allow_start.wait(timeout=1.0)
+
+    def shutdown():
+        shutdown_entered.set()
+        manager.shutdown()
+        shutdown_done.set()
+
+    manager = _configured_manager(
+        unused_tcp_port,
+        start=start,
+        stop=lambda: stops.append(True),
+    )
+    claim_thread = threading.Thread(
+        target=lambda: claims.append(manager.ensure_control()),
+    )
+    shutdown_thread = threading.Thread(target=shutdown)
+    try:
+        claim_thread.start()
+        assert start_entered.wait(timeout=1.0)
+        shutdown_thread.start()
+        assert shutdown_entered.wait(timeout=1.0)
+
+        # Shutdown must wait for startup instead of tearing resources down
+        # underneath it and then allowing startup to publish a stale owner.
+        assert not shutdown_done.wait(timeout=0.05)
+        allow_start.set()
+        claim_thread.join(timeout=1.0)
+        shutdown_thread.join(timeout=1.0)
+
+        assert len(claims) == 1
+        assert claims[0].acquired is True
+        assert stops == [True]
+        assert manager.status()["control_role"] == "standby"
+        assert manager.status()["control_availability"] == "available"
+    finally:
+        allow_start.set()
+        manager.shutdown()
+
+
+def test_incomplete_cleanup_retains_port_ownership(unused_tcp_port):
+    cleanup_ready = {"value": False}
+    owner = _configured_manager(
+        unused_tcp_port,
+        stop=lambda: cleanup_ready["value"],
+    )
+    standby = _configured_manager(unused_tcp_port)
+    try:
+        assert owner.ensure_control().acquired is True
+
+        incomplete = owner.release()
+        assert incomplete.released is False
+        assert "still stopping" in incomplete.error
+        assert incomplete.control["control_role"] == "owner"
+        assert standby.ensure_control().acquired is False
+
+        cleanup_ready["value"] = True
+        assert owner.release().released is True
+        assert standby.ensure_control().acquired is True
+    finally:
+        cleanup_ready["value"] = True
+        owner.shutdown()
+        standby.shutdown()
+
+
+def test_cleanup_exception_retains_port_ownership(unused_tcp_port):
+    cleanup_raises = {"value": True}
+
+    def stop():
+        if cleanup_raises["value"]:
+            raise RuntimeError("dashboard still bound")
+        return True
+
+    owner = _configured_manager(unused_tcp_port, stop=stop)
+    standby = _configured_manager(unused_tcp_port)
+    try:
+        assert owner.ensure_control().acquired is True
+
+        failed = owner.release()
+        assert failed.released is False
+        assert "dashboard still bound" in failed.error
+        assert standby.ensure_control().acquired is False
+
+        cleanup_raises["value"] = False
+        assert owner.release().released is True
+        assert standby.ensure_control().acquired is True
+    finally:
+        cleanup_raises["value"] = False
+        owner.shutdown()
+        standby.shutdown()
+
+
 def test_release_refuses_active_operation(unused_tcp_port):
     manager = _configured_manager(unused_tcp_port)
     try:
@@ -165,6 +294,32 @@ def test_unrelated_listener_is_reported_as_unknown(unused_tcp_port):
         manager.shutdown()
 
 
+def test_non_object_status_payload_is_reported_as_unknown(unused_tcp_port):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", unused_tcp_port))
+    listener.listen(1)
+
+    def respond():
+        client, _address = listener.accept()
+        try:
+            client.sendall(b"[]\n")
+        finally:
+            client.close()
+
+    responder = threading.Thread(target=respond)
+    responder.start()
+    manager = _configured_manager(unused_tcp_port)
+    try:
+        status = manager.status()
+        assert status["control_role"] == "standby"
+        assert status["control_availability"] == "occupied_unknown"
+        assert status["owner"] is None
+    finally:
+        listener.close()
+        responder.join(timeout=1.0)
+        manager.shutdown()
+
+
 def test_dashboard_shutdown_tolerates_unstarted_thread(monkeypatch):
     """A startup/shutdown race must not abort dashboard cleanup."""
     import MCP_Server.state as state
@@ -182,17 +337,58 @@ def test_dashboard_shutdown_tolerates_unstarted_thread(monkeypatch):
     monkeypatch.setattr(state, "dashboard_server", server)
     monkeypatch.setattr(state, "dashboard_thread", pending)
 
-    stop_dashboard_server()
+    assert stop_dashboard_server() is False
 
     assert server.should_exit is True
-    assert state.dashboard_server is None
-    assert state.dashboard_thread is None
+    assert state.dashboard_server is server
+    assert state.dashboard_thread is pending
 
     # If start() wins after teardown, the stop signal is already visible and
     # the pending server can exit instead of becoming a leaked owner resource.
     pending.start()
     pending.join(timeout=1.0)
     assert observed_stop == [True]
+    assert stop_dashboard_server() is True
+    assert state.dashboard_server is None
+    assert state.dashboard_thread is None
+
+
+def test_dashboard_shutdown_retains_state_after_join_timeout(monkeypatch):
+    import MCP_Server.state as state
+    from MCP_Server.dashboard.server import stop_dashboard_server
+
+    class FakeServer:
+        should_exit = False
+
+    class FakeThread:
+        ident = 123
+        name = "slow-dashboard"
+
+        def __init__(self):
+            self.alive = True
+            self.joined = False
+
+        def join(self, timeout):
+            assert timeout == 3.0
+            self.joined = True
+
+        def is_alive(self):
+            return self.alive
+
+    server = FakeServer()
+    thread = FakeThread()
+    monkeypatch.setattr(state, "dashboard_server", server)
+    monkeypatch.setattr(state, "dashboard_thread", thread)
+
+    assert stop_dashboard_server() is False
+    assert thread.joined is True
+    assert state.dashboard_server is server
+    assert state.dashboard_thread is thread
+
+    thread.alive = False
+    assert stop_dashboard_server() is True
+    assert state.dashboard_server is None
+    assert state.dashboard_thread is None
 
 
 def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
@@ -228,7 +424,7 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
     monkeypatch.setattr(state, "ableton_connected_event", connected)
     monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 1.0})
 
-    server_module._stop_control_backend()
+    assert server_module._stop_control_backend() is False
 
     assert stop_event.is_set()
     assert cleanup == [
@@ -236,8 +432,8 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
         ("ableton", True),
         ("m4l", True),
     ]
-    assert state.control_background_threads == []
-    assert state.control_stop_event is None
+    assert state.control_background_threads == [pending]
+    assert state.control_stop_event is stop_event
     assert state.ableton_connection is None
     assert state.m4l_connection is None
     assert not state.ableton_connected_event.is_set()
@@ -247,6 +443,47 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
     pending.start()
     pending.join(timeout=1.0)
     assert cleanup[-1] == ("pending", True)
+    assert server_module._stop_control_backend() is True
+    assert state.control_background_threads == []
+    assert state.control_stop_event is None
+
+
+def test_backend_shutdown_retains_live_worker_after_join_timeout(monkeypatch):
+    import MCP_Server.server as server_module
+    import MCP_Server.state as state
+
+    class FakeThread:
+        ident = 456
+        name = "slow-cache-worker"
+
+        def __init__(self):
+            self.alive = True
+
+        def join(self, timeout):
+            assert timeout == 3.0
+
+        def is_alive(self):
+            return self.alive
+
+    stop_event = threading.Event()
+    worker = FakeThread()
+    monkeypatch.setattr(server_module, "stop_dashboard_server", lambda: True)
+    monkeypatch.setattr(state, "control_stop_event", stop_event)
+    monkeypatch.setattr(state, "control_background_threads", [worker])
+    monkeypatch.setattr(state, "ableton_connection", None)
+    monkeypatch.setattr(state, "m4l_connection", None)
+    monkeypatch.setattr(state, "ableton_connected_event", threading.Event())
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 1.0})
+
+    assert server_module._stop_control_backend() is False
+    assert stop_event.is_set()
+    assert state.control_background_threads == [worker]
+    assert state.control_stop_event is stop_event
+
+    worker.alive = False
+    assert server_module._stop_control_backend() is True
+    assert state.control_background_threads == []
+    assert state.control_stop_event is None
 
 
 @pytest.mark.asyncio
@@ -258,19 +495,19 @@ async def test_two_stdio_clients_keep_tools_while_control_is_owned(unused_tcp_po
     lock_port = unused_tcp_port_factory()
     dashboard_port = unused_tcp_port_factory()
     owner = _configured_manager(lock_port)
-    assert owner.ensure_control(client_name="integration-owner").acquired is True
-
-    root = Path(__file__).resolve().parents[1]
-    env = dict(os.environ)
-    env["ABLETON_BRIDGE_LOCK_PORT"] = str(lock_port)
-    env["ABLETON_BRIDGE_DASHBOARD_PORT"] = str(dashboard_port)
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "MCP_Server.server"],
-        cwd=root,
-        env=env,
-    )
     try:
+        assert owner.ensure_control(client_name="integration-owner").acquired is True
+
+        root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["ABLETON_BRIDGE_LOCK_PORT"] = str(lock_port)
+        env["ABLETON_BRIDGE_DASHBOARD_PORT"] = str(dashboard_port)
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "MCP_Server.server"],
+            cwd=root,
+            env=env,
+        )
         with tempfile.TemporaryFile(mode="w+") as errors:
             async with stdio_client(params, errlog=errors) as (read_a, write_a):
                 async with ClientSession(read_a, write_a) as client_a:

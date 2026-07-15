@@ -11,7 +11,7 @@ import gzip
 import time
 import logging
 import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from collections import deque
 
 import MCP_Server.state as state
@@ -166,7 +166,10 @@ def load_browser_cache_from_disk() -> bool:
 # Live browser scan
 # ---------------------------------------------------------------------------
 
-def populate_browser_cache(force: bool = False) -> bool:
+def populate_browser_cache(
+    force: bool = False,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
     """Scan Ableton's browser tree and cache all items for instant search.
 
     Uses a breadth-first walk up to depth 3 across 11 browser categories.
@@ -176,7 +179,7 @@ def populate_browser_cache(force: bool = False) -> bool:
     Uses a **dedicated TCP connection** to avoid corrupting the shared global
     connection when the BFS scan sends many rapid commands.
     """
-    from MCP_Server.connections.ableton import AbletonConnection
+    from MCP_Server.connections.ableton import AbletonConnection, CommandCancelled
 
     now = time.time()
     with state.browser_cache_lock:
@@ -191,6 +194,8 @@ def populate_browser_cache(force: bool = False) -> bool:
     ableton = AbletonConnection(host="localhost", port=9877)
 
     try:
+        if stop_event is not None and stop_event.is_set():
+            return False
         try:
             if not ableton.connect():
                 logger.warning("Browser cache: cannot connect to Ableton")
@@ -199,12 +204,17 @@ def populate_browser_cache(force: bool = False) -> bool:
             logger.warning("Browser cache: cannot connect to Ableton: %s", e)
             return False
 
+        if stop_event is not None and stop_event.is_set():
+            return False
+
         logger.info("Browser cache: starting scan...")
         flat_items: List[Dict[str, Any]] = []
         by_display: Dict[str, List[Dict[str, Any]]] = {}
         total = 0
 
         for path_root, display_name in BROWSER_CATEGORIES:
+            if stop_event is not None and stop_event.is_set():
+                return False
             category_items: List[Dict[str, Any]] = []
             cat_count = 0
 
@@ -212,14 +222,30 @@ def populate_browser_cache(force: bool = False) -> bool:
             queue = deque([(path_root, 0)])
 
             while queue and cat_count < BROWSER_CACHE_MAX_ITEMS:
+                if stop_event is not None and stop_event.is_set():
+                    return False
                 current_path, depth = queue.popleft()
 
                 try:
-                    result = ableton.send_command("get_browser_items_at_path", {"path": current_path}, timeout=60.0)
+                    result = ableton.send_command(
+                        "get_browser_items_at_path",
+                        {"path": current_path},
+                        timeout=60.0,
+                        stop_event=stop_event,
+                    )
+                except CommandCancelled:
+                    logger.info("Browser cache scan cancelled during shutdown")
+                    return False
                 except Exception as e:
+                    if stop_event is not None and stop_event.is_set():
+                        return False
                     logger.warning("Browser cache: failed to read '%s': %s", current_path, e)
                     # Try to re-establish connection before continuing
-                    time.sleep(2)
+                    if stop_event is not None:
+                        if stop_event.wait(2.0):
+                            return False
+                    else:
+                        time.sleep(2.0)
                     try:
                         ableton.disconnect()
                         if not ableton.connect():
@@ -262,13 +288,19 @@ def populate_browser_cache(force: bool = False) -> bool:
                         queue.append((item_path, depth + 1))
 
                 # Rate-limit to avoid overwhelming Ableton's socket handler
-                time.sleep(0.01)
+                if stop_event is not None:
+                    if stop_event.wait(0.01):
+                        return False
+                else:
+                    time.sleep(0.01)
 
             by_display[display_name] = category_items
             logger.info("Browser cache: '%s' — %d items", display_name, len(category_items))
 
-        device_map = build_device_uri_map(flat_items)
+        if stop_event is not None and stop_event.is_set():
+            return False
 
+        device_map = build_device_uri_map(flat_items)
         with state.browser_cache_lock:
             state.browser_cache_flat = flat_items
             state.browser_cache_by_category = by_display

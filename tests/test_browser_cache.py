@@ -3,13 +3,15 @@ import json
 import gzip
 import os
 import tempfile
+import threading
 from unittest.mock import patch, MagicMock
 import MCP_Server.state as state
 from MCP_Server.cache.browser import (
     build_device_uri_map, save_browser_cache_to_disk,
-    load_browser_cache_from_disk, resolve_device_uri,
+    load_browser_cache_from_disk, populate_browser_cache, resolve_device_uri,
     get_browser_cache,
 )
+from MCP_Server.connections.ableton import CommandCancelled
 
 
 class TestBuildDeviceUriMap:
@@ -92,3 +94,42 @@ class TestResolveDeviceUri:
         state.browser_cache_ready.set()
         result = resolve_device_uri("NonexistentDevice")
         assert result == "NonexistentDevice"
+
+
+def test_live_scan_honors_shutdown_and_preserves_existing_cache(monkeypatch):
+    stop_event = threading.Event()
+    existing = [{"name": "Existing"}]
+    calls = []
+
+    class FakeConnection:
+        def __init__(self, **_kwargs):
+            pass
+
+        def connect(self):
+            return True
+
+        def send_command(self, _command, _params, *, timeout, stop_event):
+            calls.append((timeout, stop_event))
+            stop_event.set()
+            raise CommandCancelled("stopping")
+
+        def disconnect(self):
+            calls.append("disconnect")
+
+    monkeypatch.setattr(
+        "MCP_Server.connections.ableton.AbletonConnection",
+        FakeConnection,
+    )
+    monkeypatch.setattr(
+        "MCP_Server.cache.browser.BROWSER_CATEGORIES",
+        [("instruments", "Instruments")],
+    )
+    monkeypatch.setattr(state, "browser_cache_flat", existing)
+    monkeypatch.setattr(state, "browser_cache_timestamp", 0.0)
+    monkeypatch.setattr(state, "browser_cache_populating", False)
+
+    assert populate_browser_cache(force=True, stop_event=stop_event) is False
+    assert calls[0] == (60.0, stop_event)
+    assert calls[-1] == "disconnect"
+    assert state.browser_cache_flat is existing
+    assert state.browser_cache_populating is False

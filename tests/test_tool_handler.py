@@ -3,7 +3,7 @@ import json
 import threading
 import pytest
 import MCP_Server.tools._base as tool_base
-from MCP_Server.ownership import OwnershipManager
+from MCP_Server.ownership import ClaimResult, OwnershipManager
 from MCP_Server.tools._base import _tool_handler, tool_success, tool_error, _m4l_result
 
 
@@ -93,6 +93,82 @@ class TestToolHandler:
         assert result["message"] == "standby"
 
     @pytest.mark.asyncio
+    async def test_control_exempt_tool_bypasses_ableton_semaphore(self, monkeypatch):
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
+
+        @_tool_handler("checking status", requires_control=False)
+        def status_tool():
+            return "standby"
+
+        try:
+            result = json.loads(await asyncio.wait_for(status_tool(), timeout=0.2))
+            assert result["message"] == "standby"
+        finally:
+            semaphore.release()
+
+    @pytest.mark.asyncio
+    async def test_ownership_claim_is_time_bounded(self, monkeypatch):
+        started = threading.Event()
+        finish = threading.Event()
+
+        def slow_claim(**_kwargs):
+            started.set()
+            finish.wait(timeout=1.0)
+            return ClaimResult(
+                acquired=True,
+                control={"control_role": "owner"},
+            )
+
+        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
+        monkeypatch.setattr(tool_base.ownership, "ensure_control", slow_claim)
+        monkeypatch.setattr(tool_base, "_TOOL_TIMEOUT_SECONDS", 0.02)
+
+        @_tool_handler("claiming control")
+        def guarded_tool():
+            raise AssertionError("tool ran after a timed-out claim")
+
+        try:
+            result = json.loads(await guarded_tool())
+            assert started.is_set()
+            assert "timed out" in result["message"]
+        finally:
+            finish.set()
+            await asyncio.sleep(0.02)
+
+    @pytest.mark.asyncio
+    async def test_control_release_status_probe_runs_off_event_loop(self, monkeypatch):
+        event_loop_thread = threading.get_ident()
+        status_threads = []
+        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "ensure_control",
+            lambda **_kwargs: ClaimResult(
+                acquired=True,
+                control={"control_role": "owner"},
+            ),
+        )
+        monkeypatch.setattr(tool_base.ownership, "begin_operation", lambda: False)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "get_status",
+            lambda: (
+                status_threads.append(threading.get_ident())
+                or {"control_role": "standby"}
+            ),
+        )
+
+        @_tool_handler("changing Live")
+        def guarded_tool():
+            raise AssertionError("released control executed owner-only work")
+
+        result = json.loads(await guarded_tool())
+        assert result["status"] == "error"
+        assert status_threads and status_threads[0] != event_loop_thread
+
+    @pytest.mark.asyncio
     async def test_standby_tool_returns_owner_details(
         self,
         monkeypatch,
@@ -165,6 +241,19 @@ class TestToolHandler:
         finally:
             finish.set()
             manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_timed_out_task_logs_late_exception(self, caplog):
+        async def fail_late():
+            raise RuntimeError("late worker failure")
+
+        task = asyncio.create_task(fail_late())
+        await asyncio.sleep(0)
+
+        with caplog.at_level("WARNING", logger="AbletonBridge"):
+            tool_base._consume_background_result(task)
+
+        assert "late worker failure" in caplog.text
 
 
 class TestToolSuccess:

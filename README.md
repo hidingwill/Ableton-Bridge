@@ -62,6 +62,7 @@ Every MCP client receives the complete tool set, while one local process owns Ab
 - The first normal Ableton tool call automatically claims control when it is free.
 - Standby tools return a structured ownership error instead of terminating the MCP server.
 - `release_ableton_control` hands control back explicitly. Ownership is also released when the owning MCP process shuts down.
+- Port `9881` stays owned if any dashboard, connection, or background worker has not stopped; release returns `released: false` so cleanup can be retried safely.
 - Control is never stolen and has no idle timeout.
 
 ---

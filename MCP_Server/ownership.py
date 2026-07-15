@@ -61,6 +61,7 @@ class OwnershipManager:
         self._environment = environment if environment is not None else os.environ
         self._instance_id = str(uuid.uuid4())
         self._lock = threading.RLock()
+        self._transition_lock = threading.Lock()
         self._listener: Optional[socket.socket] = None
         self._responder_stop: Optional[threading.Event] = None
         self._responder_thread: Optional[threading.Thread] = None
@@ -68,7 +69,7 @@ class OwnershipManager:
         self._phase = "standby"
         self._active_operations = 0
         self._start_backend: Optional[Callable[[], None]] = None
-        self._stop_backend: Optional[Callable[[], None]] = None
+        self._stop_backend: Optional[Callable[[], Optional[bool]]] = None
 
     @property
     def port(self) -> int:
@@ -77,7 +78,7 @@ class OwnershipManager:
     def configure_backend(
         self,
         start_backend: Callable[[], None],
-        stop_backend: Callable[[], None],
+        stop_backend: Callable[[], Optional[bool]],
     ) -> None:
         """Configure lifecycle callbacks used when ownership changes."""
         with self._lock:
@@ -96,6 +97,14 @@ class OwnershipManager:
 
     def ensure_control(self, *, client_name: Optional[str] = None) -> ClaimResult:
         """Return local ownership, claiming and starting the backend if free."""
+        # Backend startup and teardown must never overlap.  The state lock is
+        # deliberately released while callbacks run, so a separate transition
+        # lock serializes those callbacks without blocking status responses.
+        with self._transition_lock:
+            return self._ensure_control(client_name=client_name)
+
+    def _ensure_control(self, *, client_name: Optional[str] = None) -> ClaimResult:
+        """Claim control while the lifecycle transition lock is held."""
         with self._lock:
             if self._listener is not None:
                 if self._phase == "owner":
@@ -141,11 +150,19 @@ class OwnershipManager:
             start_backend()
         except Exception as exc:
             logger.error("Ableton control startup failed: %s", exc)
-            self._cleanup_failed_start()
+            cleanup_complete, cleanup_error = self._cleanup_failed_start()
+            error = f"Could not start the Ableton control backend: {exc}"
+            if not cleanup_complete:
+                error += (
+                    " Cleanup is incomplete, so ownership was retained; "
+                    "retry release after owner resources stop."
+                )
+                if cleanup_error:
+                    error += f" Cleanup error: {cleanup_error}"
             return ClaimResult(
                 False,
                 self.status(),
-                f"Could not start the Ableton control backend: {exc}",
+                error,
             )
 
         with self._lock:
@@ -159,11 +176,16 @@ class OwnershipManager:
 
     def release(self, *, force: bool = False) -> ReleaseResult:
         """Release local ownership; never release another process's ownership."""
+        with self._transition_lock:
+            return self._release(force=force)
+
+    def _release(self, *, force: bool = False) -> ReleaseResult:
+        """Stop owner resources while the lifecycle transition lock is held."""
         with self._lock:
             if self._listener is None:
                 return ReleaseResult(False, self.status())
 
-            if self._phase != "owner" and not force:
+            if self._phase not in {"owner", "cleanup_failed"} and not force:
                 return ReleaseResult(
                     False,
                     self._local_status_locked(),
@@ -179,20 +201,23 @@ class OwnershipManager:
                 )
 
             self._phase = "releasing"
-            stop_backend = self._stop_backend
 
-        cleanup_error = None
-        try:
-            if stop_backend is not None:
-                stop_backend()
-        except Exception as exc:
-            cleanup_error = str(exc)
-            logger.error("Ableton control cleanup failed: %s", exc)
-        finally:
-            self._close_local_ownership()
+        cleanup_complete, cleanup_error = self._stop_backend_once()
+        if not cleanup_complete:
+            with self._lock:
+                self._phase = "cleanup_failed"
+                control = self._local_status_locked()
+            message = cleanup_error or (
+                "Ableton control cleanup is incomplete; owner resources are "
+                "still stopping. Retry release shortly."
+            )
+            logger.error("Ableton control cleanup incomplete: %s", message)
+            return ReleaseResult(False, control, message)
+
+        self._close_local_ownership()
 
         logger.info("Ableton control released by process %d", os.getpid())
-        return ReleaseResult(True, self.status(), cleanup_error)
+        return ReleaseResult(True, self.status())
 
     def shutdown(self) -> None:
         """Best-effort automatic release during MCP process shutdown."""
@@ -309,7 +334,8 @@ class OwnershipManager:
             return self._standby_status("occupied_unknown")
 
         if (
-            payload.get("service") != "AbletonBridge"
+            not isinstance(payload, dict)
+            or payload.get("service") != "AbletonBridge"
             or payload.get("protocol") != _STATUS_PROTOCOL_VERSION
             or not isinstance(payload.get("owner"), dict)
         ):
@@ -356,17 +382,30 @@ class OwnershipManager:
         if client_name and self._owner and "client_name" not in self._owner:
             self._owner["client_name"] = client_name
 
-    def _cleanup_failed_start(self) -> None:
-        stop_backend = None
+    def _stop_backend_once(self) -> tuple[bool, Optional[str]]:
+        """Run teardown once, treating ``False`` as incomplete cleanup."""
         with self._lock:
             stop_backend = self._stop_backend
         try:
-            if stop_backend is not None:
-                stop_backend()
+            result = stop_backend() if stop_backend is not None else True
         except Exception as exc:
-            logger.warning("Cleanup after backend startup failure failed: %s", exc)
-        finally:
+            return False, str(exc)
+        if result is False:
+            return False, None
+        return True, None
+
+    def _cleanup_failed_start(self) -> tuple[bool, Optional[str]]:
+        complete, error = self._stop_backend_once()
+        if complete:
             self._close_local_ownership()
+        else:
+            with self._lock:
+                self._phase = "cleanup_failed"
+            logger.warning(
+                "Cleanup after backend startup failure is incomplete%s",
+                f": {error}" if error else "",
+            )
+        return complete, error
 
     def _close_local_ownership(self) -> None:
         with self._lock:
@@ -398,7 +437,7 @@ _manager = OwnershipManager(lambda: state.SINGLETON_LOCK_PORT)
 
 def configure_backend(
     start_backend: Callable[[], None],
-    stop_backend: Callable[[], None],
+    stop_backend: Callable[[], Optional[bool]],
 ) -> None:
     _manager.configure_backend(start_backend, stop_backend)
 

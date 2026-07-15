@@ -148,7 +148,7 @@ def _browser_cache_warmup(stop_event: threading.Event):
     if stop_event.wait(0.5):  # brief settle after connection confirmed
         return
     try:
-        populate_browser_cache()
+        populate_browser_cache(stop_event=stop_event)
     except Exception as e:
         logger.warning("Browser cache warmup failed: %s", e)
 
@@ -197,43 +197,73 @@ def _start_control_backend():
         thread.start()
 
 
-def _stop_control_backend():
-    """Stop all owner-only resources so another process can claim safely."""
+def _stop_control_backend() -> bool:
+    """Stop owner-only resources and report when handoff is safe."""
+    cleanup_complete = True
     stop_event = state.control_stop_event
     if stop_event is not None:
         stop_event.set()
 
-    stop_dashboard_server()
+    try:
+        dashboard_stopped = stop_dashboard_server()
+    except Exception as exc:
+        dashboard_stopped = False
+        logger.warning("Dashboard shutdown failed during release: %s", exc)
+    if dashboard_stopped is False:
+        cleanup_complete = False
 
-    if state.ableton_connection:
+    ableton_connection = state.ableton_connection
+    if ableton_connection:
         logger.info("Disconnecting from Ableton")
-        state.ableton_connection.disconnect()
-        state.ableton_connection = None
+        try:
+            ableton_connection.disconnect()
+        except Exception as exc:
+            cleanup_complete = False
+            logger.warning("Ableton disconnect failed during release: %s", exc)
+        else:
+            if state.ableton_connection is ableton_connection:
+                state.ableton_connection = None
 
-    if state.m4l_connection:
+    m4l_connection = state.m4l_connection
+    if m4l_connection:
         logger.info("Disconnecting M4L bridge")
-        state.m4l_connection.disconnect()
-        state.m4l_connection = None
+        try:
+            m4l_connection.disconnect()
+        except Exception as exc:
+            cleanup_complete = False
+            logger.warning("M4L disconnect failed during release: %s", exc)
+        else:
+            if state.m4l_connection is m4l_connection:
+                state.m4l_connection = None
 
+    remaining_threads = []
     for thread in list(state.control_background_threads):
-        if thread is not threading.current_thread():
-            # A forced release can observe a thread after it is published but
-            # before start() runs.  Never let that join race abort the rest of
-            # backend cleanup.
-            if thread.ident is not None:
-                try:
-                    thread.join(timeout=3.0)
-                except RuntimeError as exc:
-                    logger.warning(
-                        "Could not join control background thread %s: %s",
-                        thread.name,
-                        exc,
-                    )
+        stopped = False
+        if thread is not threading.current_thread() and thread.ident is not None:
+            try:
+                thread.join(timeout=3.0)
+            except RuntimeError as exc:
+                logger.warning(
+                    "Could not join control background thread %s: %s",
+                    thread.name,
+                    exc,
+                )
+            else:
+                stopped = not thread.is_alive()
+        if not stopped:
+            cleanup_complete = False
+            remaining_threads.append(thread)
+            logger.warning(
+                "Control background thread %s is still stopping",
+                thread.name,
+            )
 
-    state.control_background_threads = []
-    state.control_stop_event = None
+    state.control_background_threads = remaining_threads
+    if cleanup_complete:
+        state.control_stop_event = None
     state.ableton_connected_event.clear()
     state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
+    return cleanup_complete
 
 
 # ===================================================================

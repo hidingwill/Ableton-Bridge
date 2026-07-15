@@ -2,8 +2,14 @@ import pytest
 import json
 import socket
 import time
+import threading
 from unittest.mock import MagicMock, patch, PropertyMock, call
-from MCP_Server.connections.ableton import AbletonConnection, get_ableton_connection, NON_IDEMPOTENT_COMMANDS
+from MCP_Server.connections.ableton import (
+    AbletonConnection,
+    CommandCancelled,
+    NON_IDEMPOTENT_COMMANDS,
+    get_ableton_connection,
+)
 from MCP_Server.constants import TIER_0_COMMANDS, TIER_1_COMMANDS, TIER_2_COMMANDS
 import MCP_Server.state as state
 
@@ -74,6 +80,26 @@ class TestAbletonConnectionSendCommand:
         assert len(TIER_0_COMMANDS & TIER_1_COMMANDS) == 0
         assert len(TIER_1_COMMANDS & TIER_2_COMMANDS) == 0
         assert len(TIER_0_COMMANDS & TIER_2_COMMANDS) == 0
+
+    def test_receive_full_response_honors_shutdown(self):
+        conn = AbletonConnection(host="localhost", port=9877)
+        client, server = socket.socketpair()
+        stop_event = threading.Event()
+        timer = threading.Timer(0.05, stop_event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(CommandCancelled):
+                conn.receive_full_response(
+                    client,
+                    timeout=5.0,
+                    stop_event=stop_event,
+                )
+            assert time.monotonic() - started < 1.0
+        finally:
+            timer.cancel()
+            client.close()
+            server.close()
 
 
 class TestGetAbletonConnection:

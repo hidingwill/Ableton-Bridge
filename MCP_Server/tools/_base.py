@@ -42,39 +42,58 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            try:
-                async with _ableton_semaphore:
-                    track_control = requires_control and ownership.is_configured()
-                    if track_control:
-                        claim = await asyncio.to_thread(
+            async def invoke():
+                track_control = requires_control and ownership.is_configured()
+                if track_control:
+                    claim_task = asyncio.create_task(
+                        asyncio.to_thread(
                             ownership.ensure_control,
                             client_name=_get_client_name(args, kwargs),
                         )
-                        if not claim.acquired:
-                            return tool_error(
-                                claim.error or "Ableton control is unavailable.",
-                                {"control": claim.control},
-                            )
-
-                    task = asyncio.create_task(
-                        asyncio.to_thread(
-                            _run_sync_tool,
-                            func,
-                            args,
-                            kwargs,
-                            track_control,
-                        )
                     )
                     try:
-                        result = await asyncio.wait_for(
-                            asyncio.shield(task),
+                        claim = await asyncio.wait_for(
+                            asyncio.shield(claim_task),
                             timeout=_TOOL_TIMEOUT_SECONDS,
                         )
                     except asyncio.TimeoutError:
-                        # The worker thread cannot be cancelled. Keep observing it
-                        # so ownership remains busy until the real work finishes.
-                        task.add_done_callback(_consume_background_result)
+                        claim_task.add_done_callback(_consume_background_result)
                         raise
+                    if not claim.acquired:
+                        return tool_error(
+                            claim.error or "Ableton control is unavailable.",
+                            {"control": claim.control},
+                        )
+
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _run_sync_tool,
+                        func,
+                        args,
+                        kwargs,
+                        track_control,
+                    )
+                )
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_TOOL_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # The worker thread cannot be cancelled. Keep observing it
+                    # so ownership remains busy until the real work finishes.
+                    task.add_done_callback(_consume_background_result)
+                    raise
+
+            try:
+                if requires_control:
+                    async with _ableton_semaphore:
+                        result = await invoke()
+                else:
+                    # Status and release are recovery paths.  They must remain
+                    # callable while an owner-dependent tool holds the socket
+                    # semaphore or an ownership claim is still starting.
+                    result = await invoke()
                 if isinstance(result, str):
                     stripped = result.strip()
                     if stripped.startswith(("{", "[")):
@@ -89,7 +108,8 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
             except ConnectionError as e:
                 return tool_error(f"M4L bridge not available: {e}")
             except _ControlReleasedError as e:
-                return tool_error(str(e), {"control": ownership.get_status()})
+                control = await asyncio.to_thread(ownership.get_status)
+                return tool_error(str(e), {"control": control})
             except Exception as e:
                 logger.error("Error %s: %s", error_prefix, e)
                 return tool_error(f"Error {error_prefix}: {e}")
@@ -113,9 +133,14 @@ def _run_sync_tool(func, args: tuple, kwargs: dict, track_control: bool):
 def _consume_background_result(task: asyncio.Task) -> None:
     """Retrieve a timed-out task's result so late exceptions are not leaked."""
     try:
-        task.exception()
-    except (asyncio.CancelledError, Exception):
-        pass
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning("Could not inspect timed-out tool task: %s", exc)
+    else:
+        if exc is not None:
+            logger.warning("Timed-out tool task finished with error: %s", exc)
 
 
 def _get_client_name(args: tuple, kwargs: dict) -> str | None:
