@@ -9,7 +9,6 @@ Variable names have **no** underscore prefix -- they are accessed as e.g.
 """
 
 import os
-import socket
 import threading
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -37,6 +36,7 @@ tool_call_log: deque = deque(maxlen=500)
 tool_call_counts: Dict[str, int] = {}
 tool_call_lock: threading.Lock = threading.Lock()
 dashboard_server: Optional[Any] = None  # uvicorn.Server | None
+dashboard_thread: Optional[threading.Thread] = None
 server_log_buffer: deque = deque(maxlen=1000)
 server_log_lock: threading.Lock = threading.Lock()
 
@@ -74,9 +74,10 @@ DASHBOARD_PORT: int = int(os.environ.get("ABLETON_BRIDGE_DASHBOARD_PORT", "9880"
 SINGLETON_LOCK_PORT: int = int(os.environ.get("ABLETON_BRIDGE_LOCK_PORT", "9881"))
 
 # ---------------------------------------------------------------------------
-# Singleton lock
+# Control-owner backend lifecycle
 # ---------------------------------------------------------------------------
-singleton_lock_sock: Optional[socket.socket] = None
+control_stop_event: Optional[threading.Event] = None
+control_background_threads: List[threading.Thread] = []
 
 # ---------------------------------------------------------------------------
 # MCP server instance (set by server.py after creating the FastMCP object)

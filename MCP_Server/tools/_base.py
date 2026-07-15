@@ -4,6 +4,8 @@ import functools
 import json
 import logging
 
+import MCP_Server.ownership as ownership
+
 logger = logging.getLogger("AbletonBridge")
 
 # Limits concurrent tool executions that use the Ableton TCP connection.
@@ -16,7 +18,11 @@ _ableton_semaphore = asyncio.Semaphore(1)
 _TOOL_TIMEOUT_SECONDS = 120.0
 
 
-def _tool_handler(error_prefix: str):
+class _ControlReleasedError(RuntimeError):
+    """Raised when queued backend work starts after ownership was released."""
+
+
+def _tool_handler(error_prefix: str, *, requires_control: bool = True):
     """Decorator that wraps tool functions with standard error handling.
 
     Runs the synchronous tool function in a thread pool via asyncio.to_thread()
@@ -38,10 +44,37 @@ def _tool_handler(error_prefix: str):
         async def wrapper(*args, **kwargs):
             try:
                 async with _ableton_semaphore:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(func, *args, **kwargs),
-                        timeout=_TOOL_TIMEOUT_SECONDS,
+                    track_control = requires_control and ownership.is_configured()
+                    if track_control:
+                        claim = await asyncio.to_thread(
+                            ownership.ensure_control,
+                            client_name=_get_client_name(args, kwargs),
+                        )
+                        if not claim.acquired:
+                            return tool_error(
+                                claim.error or "Ableton control is unavailable.",
+                                {"control": claim.control},
+                            )
+
+                    task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _run_sync_tool,
+                            func,
+                            args,
+                            kwargs,
+                            track_control,
+                        )
                     )
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(task),
+                            timeout=_TOOL_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        # The worker thread cannot be cancelled. Keep observing it
+                        # so ownership remains busy until the real work finishes.
+                        task.add_done_callback(_consume_background_result)
+                        raise
                 if isinstance(result, str):
                     stripped = result.strip()
                     if stripped.startswith(("{", "[")):
@@ -55,11 +88,47 @@ def _tool_handler(error_prefix: str):
                 return tool_error(f"Invalid input: {e}")
             except ConnectionError as e:
                 return tool_error(f"M4L bridge not available: {e}")
+            except _ControlReleasedError as e:
+                return tool_error(str(e), {"control": ownership.get_status()})
             except Exception as e:
                 logger.error("Error %s: %s", error_prefix, e)
                 return tool_error(f"Error {error_prefix}: {e}")
         return wrapper
     return decorator
+
+
+def _run_sync_tool(func, args: tuple, kwargs: dict, track_control: bool):
+    """Run a sync tool while tracking work that may outlive its async timeout."""
+    if track_control and not ownership.begin_operation():
+        raise _ControlReleasedError(
+            "Ableton control was released before this operation began. Try again."
+        )
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if track_control:
+            ownership.end_operation()
+
+
+def _consume_background_result(task: asyncio.Task) -> None:
+    """Retrieve a timed-out task's result so late exceptions are not leaked."""
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _get_client_name(args: tuple, kwargs: dict) -> str | None:
+    """Read the MCP initialize client name from a tool Context when available."""
+    for candidate in (*args, *kwargs.values()):
+        try:
+            params = candidate.session.client_params
+            name = params.clientInfo.name if params and params.clientInfo else None
+        except (AttributeError, ValueError):
+            continue
+        if isinstance(name, str) and name:
+            return name
+    return None
 
 
 def _m4l_result(result: dict) -> dict:
@@ -78,9 +147,12 @@ def tool_success(message: str, data: dict = None) -> str:
     return json.dumps(result)
 
 
-def tool_error(message: str) -> str:
+def tool_error(message: str, data: dict = None) -> str:
     """Create a standardized error response."""
-    return json.dumps({"status": "error", "message": message})
+    result = {"status": "error", "message": message}
+    if data:
+        result["data"] = data
+    return json.dumps(result)
 
 
 def _report_progress(ctx, current: float, total: float, message: str = None):

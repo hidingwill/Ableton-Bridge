@@ -1,11 +1,12 @@
 """Session & transport tool handlers for AbletonBridge."""
 import json
 from mcp.server.fastmcp import Context
-from MCP_Server.tools._base import _tool_handler, _m4l_result
+from MCP_Server.tools._base import _tool_handler, _m4l_result, tool_error, tool_success
 from MCP_Server.connections.ableton import get_ableton_connection
 from MCP_Server.connections.m4l import get_m4l_connection
 from MCP_Server.validation import _validate_index, _validate_index_allow_negative, _validate_range
 import MCP_Server.state as state
+import MCP_Server.ownership as ownership
 from MCP_Server.dashboard.server import get_m4l_status
 
 
@@ -13,7 +14,7 @@ def register_tools(mcp):
     """Register session & transport tools with the MCP server."""
 
     @mcp.tool()
-    @_tool_handler("getting server capabilities")
+    @_tool_handler("getting server capabilities", requires_control=False)
     def get_server_capabilities(ctx: Context) -> str:
         """Report server version, connection status, available feature sets, and tool count.
 
@@ -31,6 +32,7 @@ def register_tools(mcp):
 
         return json.dumps({
             "server_version": __version__,
+            **ownership.get_status(),
             "ableton_connected": ableton_connected,
             "m4l_connected": m4l_connected,
             "m4l_sockets_ready": m4l_sockets_ready,
@@ -51,6 +53,29 @@ def register_tools(mcp):
                 "param_maps": len(state.param_map_store),
             },
         })
+
+
+    @mcp.tool()
+    @_tool_handler("releasing Ableton control", requires_control=False)
+    def release_ableton_control(ctx: Context) -> str:
+        """Release Ableton control owned by this MCP process.
+
+        This never steals or releases another task's ownership. If this task is
+        already on standby, the response is a harmless no-op.
+        """
+        result = ownership.release_control()
+        data = {
+            "released": result.released,
+            "control": result.control,
+        }
+        if result.error and not result.released:
+            return tool_error(result.error, data)
+        if result.released:
+            message = "Ableton control released."
+            if result.error:
+                message += f" Backend cleanup warning: {result.error}"
+            return tool_success(message, data)
+        return tool_success("This task did not own Ableton control.", data)
 
 
     @mcp.tool()

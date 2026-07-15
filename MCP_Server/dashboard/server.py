@@ -169,21 +169,38 @@ def start_dashboard_server():
         log_level="warning",
         access_log=False,
     )
-    state.dashboard_server = uvicorn.Server(config)
+    server = uvicorn.Server(config)
+    state.dashboard_server = server
 
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(state.dashboard_server.serve())
+        try:
+            loop.run_until_complete(server.serve())
+        finally:
+            loop.close()
+            if state.dashboard_server is server:
+                state.dashboard_server = None
+            if state.dashboard_thread is threading.current_thread():
+                state.dashboard_thread = None
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard-http")
+    state.dashboard_thread = thread
     thread.start()
     logger.info("Dashboard started at http://127.0.0.1:%d", state.DASHBOARD_PORT)
 
 
 def stop_dashboard_server():
     """Signal the dashboard server to shut down."""
-    if state.dashboard_server:
-        state.dashboard_server.should_exit = True
+    server = state.dashboard_server
+    thread = state.dashboard_thread
+    if server:
+        server.should_exit = True
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=3.0)
+    if state.dashboard_server is server:
         state.dashboard_server = None
+    if state.dashboard_thread is thread:
+        state.dashboard_thread = None
+    if server or thread:
         logger.info("Dashboard server stopped")

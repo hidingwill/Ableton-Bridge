@@ -5,11 +5,13 @@ cross-tool usage patterns. See: https://blog.modelcontextprotocol.io/posts/2025-
 """
 
 SERVER_INSTRUCTIONS = """
-AbletonBridge provides 341 tools for controlling Ableton Live sessions. This guidance covers cross-tool relationships, sequencing, and constraints not documented on individual tools.
+AbletonBridge provides 347 tools for controlling Ableton Live sessions. This guidance covers cross-tool relationships, sequencing, and constraints not documented on individual tools.
 
 ## Startup
 
-Call get_server_capabilities first in every session. It reports ableton_connected, m4l_connected, browser cache state, and tool count. If ableton_connected is false, most tools will fail.
+Call get_server_capabilities first in every session. It reports control_role, control_availability, owner process metadata, connection state, browser cache state, and tool count. This status call does not claim control.
+
+The first normal Ableton tool call automatically claims control when control_availability is "available". If another task owns control, tools return a structured ownership error instead of disappearing. Ask the owning task to call release_ableton_control when an intentional handoff is needed. Never assume control can be stolen or released by a standby task.
 
 ## Compound Tools
 

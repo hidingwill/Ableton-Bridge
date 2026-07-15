@@ -1,6 +1,6 @@
 # AbletonBridge
 
-**359 tools connecting Claude AI to Ableton Live** (340 core + 19 optional ElevenLabs voice/SFX tools)
+**366 tools connecting Claude AI to Ableton Live** (347 core + 19 optional ElevenLabs voice/SFX tools)
 
 AbletonBridge gives Claude direct control over your Ableton Live session through the Model Context Protocol. Create tracks, write MIDI, design sounds, mix, automate, browse instruments, snapshot presets, and navigate deep into device chains and modulation matrices — all through natural language conversation.
 
@@ -31,14 +31,15 @@ Claude AI  <--MCP-->  MCP Server  <--TCP:9877-->  Ableton Remote Script
                           +---<--HTTP:9880-->  Web Status Dashboard
 
 MCP Server (modular architecture):
-  server.py          — slim orchestrator (~300 lines)
+  server.py          — MCP orchestrator + owner-only backend lifecycle
+  ownership.py       — process ownership, status, and safe handoff
   state.py           — centralized global state + locks
   constants.py       — command tiers, browser categories
   validation.py      — input validation + size limits
   connections/       — ableton.py (TCP), m4l.py (UDP/OSC)
   cache/             — browser.py (cache + disk persistence)
   dashboard/         — html.py, server.py (Starlette)
-  tools/             — 15 modules (340 tools)
+  tools/             — 16 modules (347 tools)
   prompts.py         — 4 MCP prompt templates
   instructions.py    — server instructions (cross-tool guidance)
 ```
@@ -53,28 +54,41 @@ MCP Server (modular architecture):
 
 ---
 
-## Tool Overview (340 core + 19 optional = 359 total)
+## Multiple MCP Clients
+
+Every MCP client receives the complete tool set, while one local process owns Ableton control at a time:
+
+- `get_server_capabilities` reports whether this process is the owner or a standby, plus owner process metadata when available.
+- The first normal Ableton tool call automatically claims control when it is free.
+- Standby tools return a structured ownership error instead of terminating the MCP server.
+- `release_ableton_control` hands control back explicitly. Ownership is also released when the owning MCP process shuts down.
+- Control is never stolen and has no idle timeout.
+
+---
+
+## Tool Overview (347 core + 19 optional = 366 total)
 
 | Area | Examples | Count |
 |---|---|---|
-| Session & Transport | tempo, play/record, capture, Link, punch, playback position | ~53 |
-| Tracks & Mixing | create/rename tracks, routing, monitoring, groups, implicit arm | ~29 |
-| Clips & Scenes | create/edit clips, follow actions, warp markers | ~54 |
-| Scenes | create/delete/duplicate, fire, name, color, tempo, follow actions | ~10 |
-| Mixer | unified set_mixer, batch_set_mixer, sends, crossfader | ~13 |
-| Devices & Parameters | load/configure, rack chains, rack macros, sidechain, plugin info | ~45 |
-| Browser & Presets | search/load instruments, presets, device presets | ~12 |
-| Automation | clip/track automation, envelopes, curves | ~12 |
-| Arrangement | arrangement clips, time editing, composition analysis | ~17 |
-| Creative Generation | Euclidean rhythms, chords, drums, arpeggios, bass, transforms | ~17 |
-| Deep Access (M4L) | hidden params, chain internals, audio analysis, note surgery | ~40 |
-| Snapshots & Macros | snapshot/restore, morph, macros, parameter maps | ~18 |
-| Audio Analysis | audio clip info, track meters, input meters | ~3 |
-| Grid Notation | ASCII drum/melodic pattern I/O | ~2 |
-| Compound Workflows | create instrument/drum track, batch mixer, effect chains | ~11 |
-| **Core subtotal** | | **340** |
+| Session & Transport | ownership, tempo, play/record, capture, Link, punch, playback position | 52 |
+| Tracks | create/rename tracks, routing, monitoring, groups, implicit arm | 29 |
+| Clips | create/edit clips, notes, follow actions, warp markers | 56 |
+| Scenes | create/delete/duplicate, fire, name, color, tempo, follow actions | 10 |
+| Mixer | unified set_mixer, sends, crossfader | 13 |
+| Devices & Parameters | load/configure, rack chains, rack macros, sidechain, plugin info | 50 |
+| Browser & Presets | search/load instruments, presets, device presets | 12 |
+| Automation | clip/track automation, envelopes, curves | 12 |
+| Arrangement | arrangement clips, time editing, composition analysis | 17 |
+| Creative Generation | Euclidean rhythms, chords, drums, arpeggios, bass, transforms | 17 |
+| Deep Access (M4L) | hidden params, chain internals, audio analysis, note surgery | 40 |
+| Snapshots & Macros | snapshot/restore, morph, macros, parameter maps | 19 |
+| Audio Analysis | audio clip info, track meters, input meters | 3 |
+| Grid Notation | ASCII drum/melodic pattern I/O | 2 |
+| Compound Workflows | create instrument/drum track, batch mixer, effect chains | 10 |
+| MIDI CC | mapped plugin control, channel assignment, raw CC | 5 |
+| **Core subtotal** | | **347** |
 | ElevenLabs (optional) | voice generation, SFX, cloning, transcription | 19 |
-| **Total** | | **359** |
+| **Total** | | **366** |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete per-tool breakdown.
 
@@ -92,7 +106,7 @@ AbletonBridge is built to handle real-world sessions without crashing Ableton:
 - **Fire-and-forget writes** — no post-set readback (the #1 crash pattern)
 - **Command-specific timeouts** — per-command timeouts (e.g., freeze_track → 60s, load_instrument → 30s) instead of fixed 10s/15s
 - **Socket drain** — clears stale UDP responses before each command
-- **Singleton guard** — exclusive port lock prevents duplicate server instances
+- **Single backend owner** — every MCP process stays available while one process exclusively owns Live, M4L, and dashboard connections
 - **Disk-persisted cache** — 6,400+ browser items in gzip; instant startup (~50ms)
 - **Auto-reconnect** — exponential backoff for TCP and UDP connections
 - **Tiered command delays** — 3-tier system (0ms/10ms/20ms) eliminates unnecessary waits for property setters
@@ -100,18 +114,18 @@ AbletonBridge is built to handle real-world sessions without crashing Ableton:
 - **Concurrency control** — async semaphore serializes tool dispatch; threading locks protect TCP and UDP sockets from corruption
 - **Tool execution timeout** — 120s hard timeout prevents stuck tools from blocking the entire pipeline
 - **Bounded thread pool** — explicit 8-worker limit prevents resource exhaustion during rapid tool call bursts
-- **Standardized responses** — all 340 tools return consistent `tool_success()`/`tool_error()` JSON envelopes via decorator
+- **Standardized responses** — all 347 tools return consistent `tool_success()`/`tool_error()` JSON envelopes via decorator
 - **Chunk reassembly hardening** — duplicate detection, progress logging, missing chunk index reporting
 - **Parameter resolution cache** — 500-entry FIFO cache for brute-force display→value resolution (O(1) after first call)
 - **Effect chain persistence** — saved templates survive server restarts via `~/.ableton-bridge/chain_templates.json`
-- **214 tests** — 11 test files covering connections, M4L, cache, creative tools, workflows, and validation edge cases
+- **225 tests** — 12 test files covering ownership, multi-client stdio, connections, M4L, cache, creative tools, workflows, and validation edge cases
 
 ---
 
 ## Flexibility
 
 - **Any MCP client** — Claude Desktop, Cursor, Claude Code, or any MCP-compatible tool
-- **300 tools without Max for Live** — full session control via TCP/UDP Remote Script; M4L is optional
+- **307 tools without Max for Live** — full session control via TCP/UDP Remote Script; M4L is optional
 - **+40 deep-access tools with M4L** — hidden parameters, rack internals, audio analysis, event monitoring
 - **+19 optional ElevenLabs tools** — AI voice generation, sound effects, cloning, transcription
 - **Ableton Live 10, 11, and 12** — graceful API fallbacks for version-specific features

@@ -2,7 +2,7 @@
 
 ## Overview
 
-AbletonBridge is a 3-layer system connecting AI assistants to Ableton Live through the Model Context Protocol (MCP). The MCP Server layer is modularized into 20+ focused modules.
+AbletonBridge is a 3-layer system connecting AI assistants to Ableton Live through the Model Context Protocol (MCP). The MCP Server layer is modularized into 20+ focused modules. Each stdio MCP process exposes the complete tool surface, while a single process owns the shared Ableton backend resources at a time.
 
 ## System Architecture
 
@@ -16,7 +16,7 @@ AbletonBridge is a 3-layer system connecting AI assistants to Ableton Live throu
 │                    MCP Server                         │
 │  ┌─────────┐  ┌────────────┐  ┌──────────────┐      │
 │  │ server.py│  │  tools/*   │  │  prompts.py  │      │
-│  │(orchestr)│  │(15 modules)│  │(4 workflows) │      │
+│  │(orchestr)│  │(16 modules)│  │(4 workflows) │      │
 │  └────┬─────┘  └─────┬──────┘  └──────────────┘      │
 │       │              │         ┌──────────────┐       │
 │       │              │         │instructions. │       │
@@ -56,10 +56,13 @@ AbletonBridge is a 3-layer system connecting AI assistants to Ableton Live throu
 ```
 MCP_Server/
 ├── __init__.py              # Package init, __version__, re-exports
-├── server.py                # Slim orchestrator (~300 lines)
-│                            #   - singleton lock, lifespan, MCP instance
+├── server.py                # MCP orchestrator and owner-only backend lifecycle
+│                            #   - lifespan, backend start/stop, MCP instance
 │                            #   - tool/prompt/resource registration
 │                            #   - call instrumentation for dashboard
+├── ownership.py             # Cross-process Ableton control coordination
+│                            #   - atomic owner lock + status responder (:9881)
+│                            #   - owner metadata, release, active-operation tracking
 ├── state.py                 # ALL global mutable state
 │                            #   - connections, stores, caches, locks
 │                            #   - threading events, config, MCP instance ref
@@ -104,25 +107,26 @@ MCP_Server/
 │                             #   - DashboardLogHandler (pipes logs to buffer)
 │
 └── tools/
-    ├── __init__.py           # register_all_tools(mcp) — calls 15 modules
+    ├── __init__.py           # register_all_tools(mcp) — calls 16 modules
     ├── _base.py              # Shared infrastructure
     │                         #   - _tool_handler (semaphore + asyncio.to_thread + timeout)
     │                         #   - _m4l_result(), tool_success(), tool_error()
-    ├── session.py            # 56 tools: transport, tempo, recording, views, playback
+    ├── session.py            # 52 tools: status, release, transport, recording, views
     ├── tracks.py             # 29 tools: track CRUD, routing, monitoring, implicit arm
-    ├── clips.py              # 54 tools: clip CRUD, notes, loop, follow actions
-    ├── mixer.py              # 22 tools: volume, pan, sends, set_mixer
-    ├── devices.py            # 44 tools: device params, racks, sidechain
+    ├── clips.py              # 56 tools: clip CRUD, notes, loop, follow actions
+    ├── mixer.py              # 13 tools: volume, pan, sends, set_mixer
+    ├── devices.py            # 50 tools: device params, racks, sidechain
     ├── browser.py            # 12 tools: search, load, presets
     ├── automation.py         # 12 tools: clip/track automation
-    ├── arrangement.py        # 12 tools: arrangement clips, time editing
+    ├── arrangement.py        # 17 tools: arrangement clips, time editing, analysis
     ├── scenes.py             # 10 tools: scene CRUD, fire, follow actions, tempo
     ├── creative.py           # 17 tools: chords, drums, arpeggios, euclidean
     ├── m4l_tools.py          # 40 tools: M4L bridge (hidden params, chains)
-    ├── snapshots.py          # 18 tools: snapshot/macro/param_map stores
+    ├── snapshots.py          # 19 tools: snapshot/macro/param_map stores
     ├── audio.py              # 3 tools: audio analysis, input meters
     ├── grid.py               # 2 tools: grid notation I/O
-    └── workflows.py          # 10 tools: compound workflow tools
+    ├── workflows.py          # 10 tools: compound workflow tools
+    └── midi_cc.py            # 5 tools: mapped and raw MIDI CC control
 ```
 
 ### Remote Script (`AbletonBridge_Remote_Script/`)
@@ -160,15 +164,16 @@ Level 0 (no internal imports):
   state.py, constants.py, validation.py, grid_notation.py, instructions.py
 
 Level 1 (imports Level 0 only):
+  ownership.py            →  state
   connections/ableton.py  →  state, constants
   connections/m4l.py      →  state
 
 Level 2 (imports Levels 0-1):
   cache/browser.py        →  state, constants, connections.ableton
   dashboard/server.py     →  state, connections.ableton
+  tools/_base.py          →  ownership
 
 Level 3 (imports Levels 0-2):
-  tools/_base.py          →  (standalone: asyncio, logging, json)
   tools/*.py              →  _base, connections, validation, state, cache
   prompts.py              →  (standalone: just receives mcp instance)
 
@@ -220,6 +225,24 @@ Recv (9879): OSC response with result (possibly chunked)
 - Real-time tool call metrics and server logs
 - Auto-refreshes every 3 seconds
 
+## Control Ownership Lifecycle
+
+MCP stdio connections are process-private: clients such as Codex may launch one AbletonBridge process per task, but the Live TCP connection, M4L receive socket, dashboard port, and related runtime state must have one owner. Tool availability is therefore separated from backend ownership.
+
+| Event | Behaviour |
+|------|-----------|
+| MCP process starts | Registers all tools immediately and begins in `standby` without connecting to Live. |
+| First normal tool call | Atomically binds loopback port `9881`, starts the backend resources, and becomes `owner`. |
+| Another process already owns `9881` | Remains healthy in `standby`; tools return a structured ownership error instead of terminating MCP initialization. |
+| Status call | `get_server_capabilities` reports `control_role`, `control_availability`, active operations, and best-effort owner process/task metadata without claiming control. |
+| Explicit release | `release_ableton_control` stops owner resources, then closes `9881`; a standby process can claim on its next normal tool call. |
+| MCP shutdown | Performs the same release automatically. |
+| Backend startup fails | Cleans up partial resources and releases `9881` so a later call can retry. |
+
+The `9881` owner socket also serves a loopback-only JSON status response. Reusing the lock socket avoids a stale metadata file or another management port. If an unrelated process occupies the port, availability is reported as `occupied_unknown`.
+
+Ownership has no idle timeout and cannot be stolen. Manual release is refused while a tool thread or owner background operation is still active, including work that outlived the MCP tool timeout. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
+
 ## Command Delay Tiers
 
 | Tier | Pre-Delay | Post-Delay | Example Commands |
@@ -247,16 +270,14 @@ Defined in `instructions.py` and passed to `FastMCP(instructions=...)`. Automati
 - `sound_design` — parameter exploration guide
 - `arrange_section` — arrangement section builder
 
-### Tools (334 core + 19 optional)
+### Tools (347 core + 19 optional ElevenLabs)
 All tools use the `@_tool_handler` decorator which:
 1. Gates execution via `asyncio.Semaphore(1)` — only one tool runs at a time, preventing thread pool exhaustion and TCP socket corruption
-2. Wraps sync functions in `asyncio.to_thread()` for non-blocking execution
-3. Enforces a 120-second timeout via `asyncio.wait_for()` — prevents stuck tools from blocking the semaphore indefinitely
-4. Catches `asyncio.TimeoutError` → "Tool timed out" responses
-5. Catches `ValueError` → "Invalid input" responses
-6. Catches `ConnectionError` → "M4L bridge not available" responses
-7. Catches generic exceptions → logged + returned as error strings
-8. Auto-wraps plain-string returns in `tool_success()` JSON envelopes
+2. Automatically claims Ableton control for normal tools; status and release are explicitly exempt
+3. Wraps sync functions in `asyncio.to_thread()` for non-blocking execution
+4. Tracks the real worker lifetime even after an async timeout, preventing unsafe release
+5. Enforces a 120-second timeout via `asyncio.wait_for()`
+6. Returns consistent structured success, validation, connection, ownership, timeout, and generic error responses
 
 ## Testing
 
@@ -267,7 +288,8 @@ tests/
 ├── test_grid_notation.py    # 7 tests: parse/format round-trips
 ├── test_constants.py        # 4 tests: tier disjointness, completeness
 ├── test_state.py            # 5 tests: thread-safety, events, stores
-└── test_tool_handler.py     # 11 tests: async decorator, error handling
+├── test_tool_handler.py     # async decorator, errors, ownership guard, timeout safety
+└── test_ownership.py        # claims, release, metadata, collisions, two stdio clients
 ```
 
 Run tests:
@@ -296,3 +318,5 @@ pytest tests/ -v
    - 5ms inter-command delay in Remote Script — defense-in-depth against scheduler flooding
 
    This layered approach replaced the original large delays (50-200ms) with proper synchronization primitives, achieving both faster throughput and better stability.
+
+8. **Available MCP, single-owner backend** — every stdio process completes MCP initialization and exposes all tools. Port `9881` coordinates one owner for Live, M4L, dashboard, and background services. This preserves the existing stdio deployment model while removing the failure mode where a singleton collision caused later clients to receive no Ableton tools.
