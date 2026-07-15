@@ -165,6 +165,90 @@ def test_unrelated_listener_is_reported_as_unknown(unused_tcp_port):
         manager.shutdown()
 
 
+def test_dashboard_shutdown_tolerates_unstarted_thread(monkeypatch):
+    """A startup/shutdown race must not abort dashboard cleanup."""
+    import MCP_Server.state as state
+    from MCP_Server.dashboard.server import stop_dashboard_server
+
+    class FakeServer:
+        should_exit = False
+
+    server = FakeServer()
+    observed_stop = []
+    pending = threading.Thread(
+        target=lambda: observed_stop.append(server.should_exit),
+        name="pending-dashboard",
+    )
+    monkeypatch.setattr(state, "dashboard_server", server)
+    monkeypatch.setattr(state, "dashboard_thread", pending)
+
+    stop_dashboard_server()
+
+    assert server.should_exit is True
+    assert state.dashboard_server is None
+    assert state.dashboard_thread is None
+
+    # If start() wins after teardown, the stop signal is already visible and
+    # the pending server can exit instead of becoming a leaked owner resource.
+    pending.start()
+    pending.join(timeout=1.0)
+    assert observed_stop == [True]
+
+
+def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
+    """An unstarted worker must not prevent the remaining owner cleanup."""
+    import MCP_Server.server as server_module
+    import MCP_Server.state as state
+
+    cleanup = []
+    stop_event = threading.Event()
+    pending = threading.Thread(
+        target=lambda: cleanup.append(("pending", stop_event.is_set())),
+        name="pending-control-worker",
+    )
+
+    class FakeConnection:
+        def __init__(self, name):
+            self.name = name
+
+        def disconnect(self):
+            cleanup.append((self.name, True))
+
+    connected = threading.Event()
+    connected.set()
+    monkeypatch.setattr(
+        server_module,
+        "stop_dashboard_server",
+        lambda: cleanup.append(("dashboard", True)),
+    )
+    monkeypatch.setattr(state, "control_stop_event", stop_event)
+    monkeypatch.setattr(state, "control_background_threads", [pending])
+    monkeypatch.setattr(state, "ableton_connection", FakeConnection("ableton"))
+    monkeypatch.setattr(state, "m4l_connection", FakeConnection("m4l"))
+    monkeypatch.setattr(state, "ableton_connected_event", connected)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 1.0})
+
+    server_module._stop_control_backend()
+
+    assert stop_event.is_set()
+    assert cleanup == [
+        ("dashboard", True),
+        ("ableton", True),
+        ("m4l", True),
+    ]
+    assert state.control_background_threads == []
+    assert state.control_stop_event is None
+    assert state.ableton_connection is None
+    assert state.m4l_connection is None
+    assert not state.ableton_connected_event.is_set()
+    assert state.m4l_ping_cache == {"result": False, "timestamp": 0.0}
+
+    # A delayed start still sees cancellation and does not restore resources.
+    pending.start()
+    pending.join(timeout=1.0)
+    assert cleanup[-1] == ("pending", True)
+
+
 @pytest.mark.asyncio
 async def test_two_stdio_clients_keep_tools_while_control_is_owned(unused_tcp_port_factory):
     """Regression proof: a lock collision must not abort either MCP handshake."""

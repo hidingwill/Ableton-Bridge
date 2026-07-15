@@ -197,7 +197,14 @@ def stop_dashboard_server():
     if server:
         server.should_exit = True
     if thread and thread is not threading.current_thread():
-        thread.join(timeout=3.0)
+        # Teardown may overlap the narrow window after the thread is
+        # published to shared state but before start() runs.  join() raises
+        # RuntimeError for an unstarted thread, so keep cleanup best-effort.
+        if thread.ident is not None:
+            try:
+                thread.join(timeout=3.0)
+            except RuntimeError as exc:
+                logger.warning("Could not join dashboard thread: %s", exc)
     if state.dashboard_server is server:
         state.dashboard_server = None
     if state.dashboard_thread is thread:

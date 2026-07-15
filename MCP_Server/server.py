@@ -215,9 +215,20 @@ def _stop_control_backend():
         state.m4l_connection.disconnect()
         state.m4l_connection = None
 
-    for thread in state.control_background_threads:
+    for thread in list(state.control_background_threads):
         if thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+            # A forced release can observe a thread after it is published but
+            # before start() runs.  Never let that join race abort the rest of
+            # backend cleanup.
+            if thread.ident is not None:
+                try:
+                    thread.join(timeout=3.0)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "Could not join control background thread %s: %s",
+                        thread.name,
+                        exc,
+                    )
 
     state.control_background_threads = []
     state.control_stop_event = None
