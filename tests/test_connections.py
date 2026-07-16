@@ -44,6 +44,7 @@ class TestAbletonConnectionSendCommand:
         conn._recv_buffer = ""
         call_count = [0]
         def side_effect(*args, **kwargs):
+            """Fail the first receive and succeed after reconnection."""
             call_count[0] += 1
             if call_count[0] == 1:
                 raise socket.error("connection reset")
@@ -82,6 +83,7 @@ class TestAbletonConnectionSendCommand:
         assert len(TIER_0_COMMANDS & TIER_2_COMMANDS) == 0
 
     def test_receive_full_response_honors_shutdown(self):
+        """Socket receive cancellation should be prompt and suppress timeout context."""
         conn = AbletonConnection(host="localhost", port=9877)
         client, server = socket.socketpair()
         stop_event = threading.Event()
@@ -89,17 +91,36 @@ class TestAbletonConnectionSendCommand:
         timer.start()
         started = time.monotonic()
         try:
-            with pytest.raises(CommandCancelled):
+            with pytest.raises(CommandCancelled) as exc_info:
                 conn.receive_full_response(
                     client,
                     timeout=5.0,
                     stop_event=stop_event,
                 )
             assert time.monotonic() - started < 1.0
+            assert exc_info.value.__suppress_context__ is True
         finally:
             timer.cancel()
             client.close()
             server.close()
+
+    def test_retry_delay_cancellation_suppresses_failure_context(self):
+        """Retry cancellation should not present the triggering command error as its cause."""
+        conn = AbletonConnection(host="localhost", port=9877)
+        conn.sock = MagicMock()
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.return_value = True
+
+        with patch.object(
+            conn,
+            "receive_full_response",
+            side_effect=RuntimeError("command failed"),
+        ):
+            with pytest.raises(CommandCancelled) as exc_info:
+                conn.send_command("get_session_info", stop_event=stop_event)
+
+        assert exc_info.value.__suppress_context__ is True
 
 
 class TestGetAbletonConnection:

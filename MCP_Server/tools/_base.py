@@ -48,55 +48,38 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                 """Claim control when required and run one guarded tool call."""
                 track_control = requires_control and ownership.is_configured()
                 if track_control:
-                    claim_task = asyncio.create_task(
-                        asyncio.to_thread(
-                            ownership.ensure_control,
-                            client_name=_get_client_name(args, kwargs),
-                        )
+                    claim = await asyncio.to_thread(
+                        ownership.ensure_control,
+                        client_name=_get_client_name(args, kwargs),
                     )
-                    try:
-                        claim = await asyncio.wait_for(
-                            asyncio.shield(claim_task),
-                            timeout=_TOOL_TIMEOUT_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        claim_task.add_done_callback(_consume_background_result)
-                        raise
                     if not claim.acquired:
                         return tool_error(
                             claim.error or "Ableton control is unavailable.",
                             {"control": claim.control},
                         )
 
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        _run_sync_tool,
-                        func,
-                        args,
-                        kwargs,
-                        track_control,
-                    )
+                return await asyncio.to_thread(
+                    _run_sync_tool,
+                    func,
+                    args,
+                    kwargs,
+                    track_control,
                 )
-                try:
-                    return await asyncio.wait_for(
-                        asyncio.shield(task),
-                        timeout=_TOOL_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    # The worker thread cannot be cancelled. Keep observing it
-                    # so ownership remains busy until the real work finishes.
-                    task.add_done_callback(_consume_background_result)
-                    raise
 
+            semaphore = None
+            if requires_control:
+                # Acquiring remains caller-cancellable. Once acquired, the
+                # lease follows the real shielded work rather than the caller.
+                semaphore = _ableton_semaphore
+                await semaphore.acquire()
+
+            task = asyncio.create_task(invoke())
+            release_deferred = False
             try:
-                if requires_control:
-                    async with _ableton_semaphore:
-                        result = await invoke()
-                else:
-                    # Status and release are recovery paths.  They must remain
-                    # callable while an owner-dependent tool holds the socket
-                    # semaphore or an ownership claim is still starting.
-                    result = await invoke()
+                result = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_TOOL_TIMEOUT_SECONDS,
+                )
                 if isinstance(result, str):
                     stripped = result.strip()
                     if stripped.startswith(("{", "[")):
@@ -104,8 +87,30 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                     return tool_success(result)
                 return result
             except asyncio.TimeoutError:
+                # Worker threads cannot be cancelled. Keep the semaphore
+                # leased until the actual claim/tool work finishes.
+                task.add_done_callback(_consume_background_result)
+                if semaphore is not None:
+                    task.add_done_callback(
+                        functools.partial(
+                            _release_ableton_semaphore,
+                            semaphore=semaphore,
+                        )
+                    )
+                    release_deferred = True
                 logger.error("Tool timed out after %ds: %s", _TOOL_TIMEOUT_SECONDS, error_prefix)
                 return tool_error(f"Tool timed out after {_TOOL_TIMEOUT_SECONDS}s: {error_prefix}")
+            except asyncio.CancelledError:
+                task.add_done_callback(_consume_background_result)
+                if semaphore is not None:
+                    task.add_done_callback(
+                        functools.partial(
+                            _release_ableton_semaphore,
+                            semaphore=semaphore,
+                        )
+                    )
+                    release_deferred = True
+                raise
             except ValueError as e:
                 return tool_error(f"Invalid input: {e}")
             except ConnectionError as e:
@@ -116,6 +121,9 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
             except Exception as e:
                 logger.error("Error %s: %s", error_prefix, e)
                 return tool_error(f"Error {error_prefix}: {e}")
+            finally:
+                if semaphore is not None and not release_deferred:
+                    semaphore.release()
         return wrapper
     return decorator
 
@@ -144,6 +152,15 @@ def _consume_background_result(task: asyncio.Task) -> None:
     else:
         if exc is not None:
             logger.warning("Timed-out tool task finished with error: %s", exc)
+
+
+def _release_ableton_semaphore(
+    _task: asyncio.Task,
+    *,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """Release a tool's captured semaphore after shielded work completes."""
+    semaphore.release()
 
 
 def _get_client_name(args: tuple, kwargs: dict) -> str | None:

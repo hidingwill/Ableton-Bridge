@@ -14,12 +14,14 @@ from MCP_Server.ownership import OwnershipManager
 
 
 def _configured_manager(port, *, start=None, stop=None, environment=None):
+    """Build an ownership manager with lightweight lifecycle callbacks."""
     manager = OwnershipManager(port, environment=environment)
     manager.configure_backend(start or (lambda: None), stop or (lambda: None))
     return manager
 
 
 def test_one_owner_and_standby_metadata(unused_tcp_port):
+    """A standby should report reliable metadata for the current owner."""
     first = _configured_manager(
         unused_tcp_port,
         environment={"CODEX_THREAD_ID": "task-owner"},
@@ -43,6 +45,7 @@ def test_one_owner_and_standby_metadata(unused_tcp_port):
 
 
 def test_release_allows_standby_to_claim(unused_tcp_port):
+    """Manual release should let a waiting process become the next owner."""
     starts = []
     stops = []
     first = _configured_manager(
@@ -68,6 +71,7 @@ def test_release_allows_standby_to_claim(unused_tcp_port):
 
 
 def test_shutdown_automatically_releases_control(unused_tcp_port):
+    """Normal process shutdown should release control for another manager."""
     owner = _configured_manager(unused_tcp_port)
     next_owner = _configured_manager(unused_tcp_port)
     try:
@@ -80,6 +84,7 @@ def test_shutdown_automatically_releases_control(unused_tcp_port):
 
 
 def test_simultaneous_claim_has_exactly_one_winner(unused_tcp_port):
+    """Concurrent claims should produce exactly one backend owner."""
     managers = [
         _configured_manager(unused_tcp_port),
         _configured_manager(unused_tcp_port),
@@ -88,6 +93,7 @@ def test_simultaneous_claim_has_exactly_one_winner(unused_tcp_port):
     results = []
 
     def claim(manager):
+        """Attempt one claim after all contenders reach the barrier."""
         barrier.wait()
         results.append(manager.ensure_control().acquired)
 
@@ -106,9 +112,11 @@ def test_simultaneous_claim_has_exactly_one_winner(unused_tcp_port):
 
 
 def test_backend_start_failure_releases_port(unused_tcp_port):
+    """A cleanly handled startup failure should make the port claimable again."""
     stopped = []
 
     def fail_start():
+        """Simulate Ableton being unavailable during backend startup."""
         raise RuntimeError("Live unavailable")
 
     failing = _configured_manager(
@@ -130,9 +138,11 @@ def test_backend_start_failure_releases_port(unused_tcp_port):
 
 
 def test_failed_start_retains_port_until_partial_cleanup_finishes(unused_tcp_port):
+    """Failed startup should retain ownership while cleanup remains incomplete."""
     cleanup_ready = {"value": False}
 
     def fail_start():
+        """Simulate startup failing after owner resources may have begun."""
         raise RuntimeError("Live unavailable")
 
     failing = _configured_manager(
@@ -158,6 +168,7 @@ def test_failed_start_retains_port_until_partial_cleanup_finishes(unused_tcp_por
 
 
 def test_startup_and_shutdown_transitions_are_serialized(unused_tcp_port):
+    """Shutdown should wait for an in-progress startup transition."""
     start_entered = threading.Event()
     allow_start = threading.Event()
     shutdown_entered = threading.Event()
@@ -166,10 +177,12 @@ def test_startup_and_shutdown_transitions_are_serialized(unused_tcp_port):
     stops = []
 
     def start():
+        """Pause backend startup until the shutdown race is observable."""
         start_entered.set()
         allow_start.wait(timeout=1.0)
 
     def shutdown():
+        """Request shutdown and record when the transition completes."""
         shutdown_entered.set()
         manager.shutdown()
         shutdown_done.set()
@@ -207,6 +220,7 @@ def test_startup_and_shutdown_transitions_are_serialized(unused_tcp_port):
 
 
 def test_incomplete_cleanup_retains_port_ownership(unused_tcp_port):
+    """A false cleanup result should retain ownership until a later retry."""
     cleanup_ready = {"value": False}
     owner = _configured_manager(
         unused_tcp_port,
@@ -232,9 +246,11 @@ def test_incomplete_cleanup_retains_port_ownership(unused_tcp_port):
 
 
 def test_cleanup_exception_retains_port_ownership(unused_tcp_port):
+    """A cleanup exception should retain ownership and surface its reason."""
     cleanup_raises = {"value": True}
 
     def stop():
+        """Fail cleanup until the test allows a successful retry."""
         if cleanup_raises["value"]:
             raise RuntimeError("dashboard still bound")
         return True
@@ -259,6 +275,7 @@ def test_cleanup_exception_retains_port_ownership(unused_tcp_port):
 
 
 def test_release_refuses_active_operation(unused_tcp_port):
+    """Manual release should refuse while an owner-dependent operation runs."""
     manager = _configured_manager(unused_tcp_port)
     try:
         assert manager.ensure_control().acquired is True
@@ -275,7 +292,38 @@ def test_release_refuses_active_operation(unused_tcp_port):
         manager.shutdown()
 
 
+def test_shutdown_retains_control_until_active_operation_finishes(unused_tcp_port):
+    """Forced shutdown must retain the port while timed-out tool work remains."""
+    stops = []
+    owner = _configured_manager(
+        unused_tcp_port,
+        stop=lambda: stops.append(True),
+    )
+    standby = _configured_manager(unused_tcp_port)
+    try:
+        assert owner.ensure_control().acquired is True
+        assert owner.begin_operation() is True
+
+        owner.shutdown()
+
+        status = owner.status()
+        assert status["control_role"] == "owner"
+        assert status["active_operations"] == 1
+        assert standby.ensure_control().acquired is False
+
+        owner.end_operation()
+        owner.shutdown()
+
+        assert stops == [True, True]
+        assert standby.ensure_control().acquired is True
+    finally:
+        owner.end_operation()
+        owner.shutdown()
+        standby.shutdown()
+
+
 def test_unrelated_listener_is_reported_as_unknown(unused_tcp_port):
+    """An unrelated process on the lock port should be classified as unknown."""
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", unused_tcp_port))
     listener.listen(1)
@@ -295,11 +343,13 @@ def test_unrelated_listener_is_reported_as_unknown(unused_tcp_port):
 
 
 def test_non_object_status_payload_is_reported_as_unknown(unused_tcp_port):
+    """Valid non-object JSON must not be mistaken for bridge owner metadata."""
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", unused_tcp_port))
     listener.listen(1)
 
     def respond():
+        """Return a syntactically valid but structurally invalid payload."""
         client, _address = listener.accept()
         try:
             client.sendall(b"[]\n")
@@ -354,6 +404,7 @@ def test_dashboard_shutdown_tolerates_unstarted_thread(monkeypatch):
 
 
 def test_dashboard_shutdown_retains_state_after_join_timeout(monkeypatch):
+    """Dashboard state should remain published while its thread is alive."""
     import MCP_Server.state as state
     from MCP_Server.dashboard.server import stop_dashboard_server
 
@@ -365,14 +416,17 @@ def test_dashboard_shutdown_retains_state_after_join_timeout(monkeypatch):
         name = "slow-dashboard"
 
         def __init__(self):
+            """Start as a simulated live dashboard thread."""
             self.alive = True
             self.joined = False
 
         def join(self, timeout):
+            """Record the bounded join without completing the thread."""
             assert timeout == 3.0
             self.joined = True
 
         def is_alive(self):
+            """Return the test-controlled liveness state."""
             return self.alive
 
     server = FakeServer()
@@ -405,9 +459,11 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
 
     class FakeConnection:
         def __init__(self, name):
+            """Name a backend connection double for cleanup ordering."""
             self.name = name
 
         def disconnect(self):
+            """Record disconnection during best-effort cleanup."""
             cleanup.append((self.name, True))
 
     connected = threading.Event()
@@ -449,6 +505,7 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
 
 
 def test_backend_shutdown_retains_live_worker_after_join_timeout(monkeypatch):
+    """Backend state should retain a worker that survives its join timeout."""
     import MCP_Server.server as server_module
     import MCP_Server.state as state
 
@@ -457,12 +514,15 @@ def test_backend_shutdown_retains_live_worker_after_join_timeout(monkeypatch):
         name = "slow-cache-worker"
 
         def __init__(self):
+            """Start as a simulated live cache worker."""
             self.alive = True
 
         def join(self, timeout):
+            """Accept the bounded join while remaining alive."""
             assert timeout == 3.0
 
         def is_alive(self):
+            """Return the test-controlled liveness state."""
             return self.alive
 
     stop_event = threading.Event()

@@ -145,7 +145,7 @@ class AbletonConnection:
                         if stop_event.is_set():
                             raise CommandCancelled(
                                 "Ableton command cancelled during shutdown"
-                            )
+                            ) from None
                         if time.monotonic() < deadline:
                             continue
                     logger.warning("Socket timeout during receive")
@@ -273,14 +273,16 @@ class AbletonConnection:
                             if stop_event.wait(0.1):
                                 raise CommandCancelled(
                                     "Ableton command cancelled during shutdown"
-                                )
+                                ) from None
                         else:
                             time.sleep(0.1)
                         if not self.connect():
-                            raise ConnectionError("Failed to reconnect to Ableton")
+                            raise ConnectionError("Failed to reconnect to Ableton") from e
                         logger.info("Reconnected, retrying command...")
                     else:
-                        raise Exception(f"Command '{command_type}' failed after {max_attempts} attempts: {e}")
+                        raise Exception(
+                            f"Command '{command_type}' failed after {max_attempts} attempts: {e}"
+                        ) from e
 
 
 def get_ableton_connection():

@@ -217,6 +217,23 @@ class OwnershipManager:
             logger.error("Ableton control cleanup incomplete: %s", message)
             return ReleaseResult(False, control, message)
 
+        with self._lock:
+            if self._active_operations:
+                count = self._active_operations
+                self._phase = "cleanup_failed"
+                control = self._local_status_locked()
+            else:
+                count = 0
+                control = None
+
+        if control is not None:
+            message = (
+                "Ableton control cleanup is incomplete because "
+                f"{count} operation(s) are still running. Retry release shortly."
+            )
+            logger.error("Ableton control cleanup incomplete: %s", message)
+            return ReleaseResult(False, control, message)
+
         self._close_local_ownership()
 
         logger.info("Ableton control released by process %d", os.getpid())

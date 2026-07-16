@@ -97,23 +97,28 @@ class TestResolveDeviceUri:
 
 
 def test_live_scan_honors_shutdown_and_preserves_existing_cache(monkeypatch):
+    """A cancelled live scan must preserve the last usable browser cache."""
     stop_event = threading.Event()
     existing = [{"name": "Existing"}]
     calls = []
 
     class FakeConnection:
         def __init__(self, **_kwargs):
+            """Create a no-op connection double."""
             pass
 
         def connect(self):
+            """Pretend the browser-scan connection succeeds."""
             return True
 
         def send_command(self, _command, _params, *, timeout, stop_event):
+            """Cancel the scan during its first browser command."""
             calls.append((timeout, stop_event))
             stop_event.set()
             raise CommandCancelled("stopping")
 
         def disconnect(self):
+            """Record cleanup of the scan connection."""
             calls.append("disconnect")
 
     monkeypatch.setattr(
