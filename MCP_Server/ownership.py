@@ -56,6 +56,7 @@ class OwnershipManager:
         host: str = "127.0.0.1",
         environment: Optional[Mapping[str, str]] = None,
     ) -> None:
+        """Initialize process-local coordination for one ownership port."""
         self._port = port
         self._host = host
         self._environment = environment if environment is not None else os.environ
@@ -73,6 +74,7 @@ class OwnershipManager:
 
     @property
     def port(self) -> int:
+        """Return the configured ownership and status-listener port."""
         return self._port() if callable(self._port) else self._port
 
     def configure_backend(
@@ -92,6 +94,7 @@ class OwnershipManager:
             self._stop_backend = None
 
     def is_configured(self) -> bool:
+        """Return whether both backend lifecycle callbacks are installed."""
         with self._lock:
             return self._start_backend is not None and self._stop_backend is not None
 
@@ -250,6 +253,7 @@ class OwnershipManager:
         return self._probe_remote_owner()
 
     def _bind_listener(self) -> socket.socket:
+        """Bind the exclusive loopback listener that represents ownership."""
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -265,6 +269,7 @@ class OwnershipManager:
             raise
 
     def _start_status_responder_locked(self) -> None:
+        """Start the owner-status responder while local state is locked."""
         assert self._listener is not None
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -282,6 +287,7 @@ class OwnershipManager:
         listener: socket.socket,
         stop_event: threading.Event,
     ) -> None:
+        """Serve owner metadata until ownership is released."""
         while not stop_event.is_set():
             try:
                 client, _address = listener.accept()
@@ -306,6 +312,7 @@ class OwnershipManager:
                 client.close()
 
     def _probe_remote_owner(self) -> dict:
+        """Classify the loopback-port occupant and read known owner metadata."""
         try:
             with socket.create_connection(
                 (self._host, self.port),
@@ -349,6 +356,7 @@ class OwnershipManager:
         }
 
     def _standby_status(self, availability: str) -> dict:
+        """Build a status envelope for this process's standby role."""
         return {
             "control_role": "standby",
             "control_availability": availability,
@@ -357,6 +365,7 @@ class OwnershipManager:
         }
 
     def _local_status_locked(self) -> dict:
+        """Build the local owner status while coordination state is locked."""
         return {
             "control_role": "owner",
             "control_availability": "owned",
@@ -365,6 +374,7 @@ class OwnershipManager:
         }
 
     def _build_owner_metadata(self, client_name: Optional[str]) -> dict:
+        """Capture reliable process identity and best-effort client metadata."""
         owner = {
             "process_id": os.getpid(),
             "parent_process_id": os.getppid(),
@@ -379,6 +389,7 @@ class OwnershipManager:
         return owner
 
     def _record_client_name(self, client_name: Optional[str]) -> None:
+        """Fill previously unavailable client metadata without replacing it."""
         if client_name and self._owner and "client_name" not in self._owner:
             self._owner["client_name"] = client_name
 
@@ -395,6 +406,7 @@ class OwnershipManager:
         return True, None
 
     def _cleanup_failed_start(self) -> tuple[bool, Optional[str]]:
+        """Clean up a failed startup and retain ownership if cleanup stalls."""
         complete, error = self._stop_backend_once()
         if complete:
             self._close_local_ownership()
@@ -408,6 +420,7 @@ class OwnershipManager:
         return complete, error
 
     def _close_local_ownership(self) -> None:
+        """Stop the responder and return the manager to standby state."""
         with self._lock:
             stop_event = self._responder_stop
             responder = self._responder_thread
@@ -439,36 +452,45 @@ def configure_backend(
     start_backend: Callable[[], None],
     stop_backend: Callable[[], Optional[bool]],
 ) -> None:
+    """Configure lifecycle callbacks on the process-wide ownership manager."""
     _manager.configure_backend(start_backend, stop_backend)
 
 
 def unconfigure_backend() -> None:
+    """Remove lifecycle callbacks from the process-wide ownership manager."""
     _manager.unconfigure_backend()
 
 
 def is_configured() -> bool:
+    """Return whether the process-wide ownership manager is configured."""
     return _manager.is_configured()
 
 
 def ensure_control(*, client_name: Optional[str] = None) -> ClaimResult:
+    """Automatically acquire process-wide Ableton control when available."""
     return _manager.ensure_control(client_name=client_name)
 
 
 def release_control(*, force: bool = False) -> ReleaseResult:
+    """Release only the Ableton control owned by this MCP process."""
     return _manager.release(force=force)
 
 
 def shutdown() -> None:
+    """Best-effort release of process-wide ownership during shutdown."""
     _manager.shutdown()
 
 
 def begin_operation() -> bool:
+    """Register owner-dependent work with the process-wide manager."""
     return _manager.begin_operation()
 
 
 def end_operation() -> None:
+    """Mark process-wide owner-dependent work as complete."""
     _manager.end_operation()
 
 
 def get_status() -> dict:
+    """Return the process-wide local or remote ownership status."""
     return _manager.status()

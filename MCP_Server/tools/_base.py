@@ -40,9 +40,12 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
     Exception -> tool_error("Error {prefix}: ...")
     """
     def decorator(func):
+        """Decorate one synchronous tool function with the shared contract."""
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
+            """Execute the wrapped tool through ownership and timeout guards."""
             async def invoke():
+                """Claim control when required and run one guarded tool call."""
                 track_control = requires_control and ownership.is_configured()
                 if track_control:
                     claim_task = asyncio.create_task(

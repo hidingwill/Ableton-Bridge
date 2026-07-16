@@ -31,6 +31,7 @@ class DashboardLogHandler(logging.Handler):
     """
 
     def emit(self, record):
+        """Append one safely formatted log record to the dashboard buffer."""
         try:
             with state.server_log_lock:
                 state.server_log_buffer.append(
@@ -152,9 +153,11 @@ def start_dashboard_server():
     import uvicorn
 
     async def dashboard_page(request):
+        """Serve the embedded dashboard application."""
         return HTMLResponse(DASHBOARD_HTML)
 
     async def api_status(request):
+        """Serve the dashboard's current JSON status snapshot."""
         return JSONResponse(build_status_json())
 
     app = Starlette(routes=[
@@ -173,6 +176,7 @@ def start_dashboard_server():
     state.dashboard_server = server
 
     def _run():
+        """Run Uvicorn on a dedicated event loop and clear exited state."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:

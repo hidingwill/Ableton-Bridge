@@ -76,6 +76,7 @@ class AbletonConnection:
                 self._udp_sock = None
 
     def __post_init__(self):
+        """Initialize per-connection receive buffering and send serialization."""
         self._recv_buffer = ""
         self._send_lock = threading.Lock()
 
