@@ -40,6 +40,7 @@ class AbletonConnection:
     def connect(self) -> bool:
         """Connect to the Ableton Remote Script socket server"""
         if self.sock:
+            self._last_socket_open = True
             return True
 
         try:
@@ -47,6 +48,7 @@ class AbletonConnection:
             self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
             self._recv_buffer = ""  # Clear buffer on new connection
+            self._last_socket_open = True
             logger.info("Connected to Ableton at %s:%s", self.host, self.port)
             return True
         except Exception as e:
@@ -57,6 +59,7 @@ class AbletonConnection:
                 except Exception:
                     pass
             self.sock = None
+            self._last_socket_open = False
             return False
 
     def disconnect(self):
@@ -68,6 +71,7 @@ class AbletonConnection:
                 logger.error("Error disconnecting from Ableton: %s", e)
             finally:
                 self.sock = None
+                self._last_socket_open = False
         if self._udp_sock:
             try:
                 self._udp_sock.close()
@@ -80,40 +84,45 @@ class AbletonConnection:
         """Initialize per-connection receive buffering and send serialization."""
         self._recv_buffer = ""
         self._send_lock = threading.Lock()
+        self._last_socket_open = self.sock is not None
 
     def is_connected(self) -> bool:
         """Passively check whether the Remote Script socket is still open.
 
         The check never sends or consumes protocol data. If a command currently
-        owns the send lock, the established socket is treated as connected so a
-        status request cannot interfere with its response handling.
+        owns the send lock, return the last verified socket result so a status
+        request cannot interfere with its response handling.
         """
         sock = self.sock
         if sock is None:
+            self._last_socket_open = False
             return False
 
         try:
             sock.getpeername()
         except OSError:
+            self._last_socket_open = False
             return False
 
         if not self._send_lock.acquire(blocking=False):
-            return True
+            return self._last_socket_open
 
         try:
             readable, _writable, _exceptional = select.select([sock], [], [], 0)
             if not readable:
+                self._last_socket_open = True
                 return True
             try:
-                return bool(sock.recv(1, socket.MSG_PEEK))
+                self._last_socket_open = bool(sock.recv(1, socket.MSG_PEEK))
             except (BlockingIOError, socket.timeout):
-                return True
+                self._last_socket_open = True
             except OSError:
-                return False
+                self._last_socket_open = False
         except (OSError, ValueError):
-            return False
+            self._last_socket_open = False
         finally:
             self._send_lock.release()
+        return self._last_socket_open
 
     def _ensure_udp_socket(self):
         """Create a UDP socket for real-time parameter sending if not already open."""

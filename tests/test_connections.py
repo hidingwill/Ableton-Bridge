@@ -158,7 +158,7 @@ class TestAbletonConnectionLiveness:
             server.close()
 
     def test_busy_connection_is_not_disturbed(self):
-        """Status should not wait for a command that owns the send lock."""
+        """Status should reuse the last healthy result while a command is active."""
         client, server = socket.socketpair()
         connection = AbletonConnection("localhost", 9877, sock=client)
         connection._send_lock.acquire()
@@ -169,6 +169,23 @@ class TestAbletonConnectionLiveness:
             connection._send_lock.release()
             client.close()
             server.close()
+
+    def test_busy_connection_preserves_last_disconnected_result(self):
+        """A busy status check should not turn a known dead socket back to true."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.shutdown(socket.SHUT_RDWR)
+            server.close()
+            assert connection.is_connected() is False
+
+            connection._send_lock.acquire()
+            assert connection.is_connected() is False
+            assert connection._send_lock.locked()
+        finally:
+            if connection._send_lock.locked():
+                connection._send_lock.release()
+            client.close()
 
 
 class TestGetAbletonConnection:
