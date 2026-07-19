@@ -33,6 +33,7 @@ Claude AI  <--MCP-->  MCP Server  <--TCP:9877-->  Ableton Remote Script
 MCP Server (modular architecture):
   server.py          — MCP orchestrator + owner-only backend lifecycle
   ownership.py       — process ownership, status, and safe handoff
+  status.py          — ownership-aware Ableton and M4L connection status
   state.py           — centralized global state + locks
   constants.py       — command tiers, browser categories
   validation.py      — input validation + size limits
@@ -58,11 +59,11 @@ MCP Server (modular architecture):
 
 Every MCP client receives the complete tool set, while one local process owns Ableton control at a time:
 
-- `get_server_capabilities` reports whether this process is the owner or a standby, plus owner process metadata when available. Connection booleans are `true` or `false` only for the owner; standbys return `null` with `not_started`, `owned_elsewhere`, or `unknown` connection states so an unstarted local backend is never mistaken for a disconnected Live instance.
+- `get_server_capabilities` reports whether this process is the owner or a standby, plus owner process metadata when available. Connection booleans are `true` or `false` only for the owner; standbys return `null` with `not_started`, `owned_elsewhere`, or `unknown` connection states so an unstarted local backend is never mistaken for a disconnected Live instance. `features.m4l_bridge` mirrors the same tri-state M4L value.
 - The first normal Ableton tool call automatically claims control when it is free.
 - Standby tools return a structured ownership error instead of terminating the MCP server.
 - `release_ableton_control` hands control back explicitly. Ownership is also released when the owning MCP process shuts down.
-- Port `9881` stays owned if any dashboard, connection, or background worker has not stopped; release returns `released: false` so cleanup can be retried safely.
+- Release returns `released: false` while a foreground control call or live M4L status probe is active. Port `9881` also stays owned if any dashboard, connection, or background worker has not stopped, so cleanup can be retried safely.
 - Control is never stolen and has no idle timeout.
 
 ---
@@ -119,7 +120,7 @@ AbletonBridge is built to handle real-world sessions without crashing Ableton:
 - **Chunk reassembly hardening** — duplicate detection, progress logging, missing chunk index reporting
 - **Parameter resolution cache** — 500-entry FIFO cache for brute-force display→value resolution (O(1) after first call)
 - **Effect chain persistence** — saved templates survive server restarts via `~/.ableton-bridge/chain_templates.json`
-- **225 tests** — 12 test files covering ownership, multi-client stdio, connections, M4L, cache, creative tools, workflows, and validation edge cases
+- **Automated regression suite** — covers ownership, multi-client stdio, connections, M4L, cache, creative tools, workflows, and validation edge cases
 
 ---
 

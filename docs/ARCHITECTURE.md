@@ -168,16 +168,16 @@ Level 0 (no internal imports):
 
 Level 1 (imports Level 0 only):
   ownership.py            →  state
-  status.py               →  state
   connections/ableton.py  →  state, constants
   connections/m4l.py      →  state
 
 Level 2 (imports Levels 0-1):
+  status.py               →  state, ownership
   cache/browser.py        →  state, constants, connections.ableton
-  dashboard/server.py     →  state, ownership, status
   tools/_base.py          →  ownership
 
 Level 3 (imports Levels 0-2):
+  dashboard/server.py     →  state, ownership, status
   tools/*.py              →  _base, connections, validation, state, status, cache
   prompts.py              →  (standalone: just receives mcp instance)
 
@@ -238,7 +238,7 @@ MCP stdio connections are process-private: clients such as Codex may launch one 
 | MCP process starts | Registers all tools immediately and begins in `standby` without connecting to Live. |
 | First normal tool call | Atomically binds loopback port `9881`, starts the backend resources, and becomes `owner`. |
 | Another process already owns `9881` | Remains healthy in `standby`; tools return a structured ownership error instead of terminating MCP initialization. |
-| Status call | `get_server_capabilities` reports ownership plus role-aware connection states without claiming control. Owner connection booleans are verified locally; standby values are `null`. |
+| Status call | `get_server_capabilities` reports ownership plus role-aware connection states without claiming control. Owner values come from local checks; standby values are `null`. |
 | Explicit release | `release_ableton_control` closes `9881` only after every owner resource has stopped; incomplete cleanup returns `released: false` and retains ownership for a safe retry. |
 | MCP shutdown | Performs the same release automatically. |
 | Backend startup fails | MCP remains healthy in standby, but owner-only services do not start. Partial resources are cleaned up and `9881` is released only after cleanup is confirmed. |
@@ -260,7 +260,9 @@ Connection status is scoped to the calling MCP process. Only the owner has backe
 
 `features.m4l_bridge` mirrors the tri-state `m4l_connected` value: `true` or `false` for the owner and `null` for standby processes.
 
-Ownership has no idle timeout and cannot be stolen. Manual release is refused while a foreground tool or controlled resource is still active, including work that outlived the MCP timeout. Owner background services such as M4L connection and browser warmup are cooperatively cancelled and joined during release; port `9881` remains owned if any worker fails to stop. Forced shutdown follows the same retention rule. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
+Ableton status is passive: it never sends or consumes protocol data. If a command owns the socket lock, status preserves the last verified socket result instead of interfering with the response stream. An expired M4L status cache may perform a live ping; that probe is registered as an owner operation, so release refuses rather than disconnecting or reconnecting M4L underneath it.
+
+Ownership has no idle timeout and cannot be stolen. Manual release is refused while a foreground tool, controlled resource, or live status probe is active. A call that times out or is cancelled before its tool body starts is abandoned; an already-running worker keeps its operation lease until it exits. Owner background services such as M4L connection and browser warmup are cooperatively cancelled and joined during release; port `9881` remains owned if any worker fails to stop. Forced shutdown follows the same retention rule. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
 
 ## Command Delay Tiers
 
@@ -294,7 +296,7 @@ All tools use the `@_tool_handler` decorator which:
 1. Gates owner-dependent execution via `asyncio.Semaphore(1)` to prevent TCP socket corruption; claim-free status and release remain available as recovery paths
 2. Automatically claims Ableton control for normal tools with a bounded wait; status and release are explicitly exempt
 3. Wraps sync functions in `asyncio.to_thread()` for non-blocking execution
-4. Tracks the real worker lifetime even after an async timeout, preventing unsafe release
+4. Abandons calls that time out before their tool body starts, while tracking already-running workers until they exit
 5. Enforces a 120-second timeout via `asyncio.wait_for()`
 6. Returns consistent structured success, validation, connection, ownership, timeout, and generic error responses
 
