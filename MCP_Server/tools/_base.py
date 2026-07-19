@@ -161,13 +161,13 @@ def _run_sync_tool(
     invocation: _InvocationGate,
 ):
     """Run a sync tool while tracking work that may outlive its async timeout."""
-    if not invocation.try_start():
-        return None
     if track_control and not ownership.begin_operation():
         raise _ControlReleasedError(
             "Ableton control was released before this operation began. Try again."
         )
     try:
+        if not invocation.try_start():
+            return None
         return func(*args, **kwargs)
     finally:
         if track_control:

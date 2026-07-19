@@ -269,7 +269,7 @@ class OwnershipManager:
         with self._lock:
             if not self.is_configured():
                 return True
-            if self._listener is None or self._phase not in {"starting", "owner"}:
+            if self._listener is None or self._phase != "owner":
                 return False
             self._active_operations += 1
             return True
@@ -448,6 +448,15 @@ class OwnershipManager:
     def _cleanup_failed_start(self) -> tuple[bool, Optional[str]]:
         """Clean up a failed startup and retain ownership if cleanup stalls."""
         complete, error = self._stop_backend_once()
+        if complete:
+            with self._lock:
+                active_operations = self._active_operations
+            if active_operations:
+                complete = False
+                error = (
+                    "Backend cleanup finished, but "
+                    f"{active_operations} owner operation(s) are still running."
+                )
         if complete:
             self._close_local_ownership()
         else:

@@ -216,6 +216,68 @@ class TestToolHandler:
         assert executions == []
 
     @pytest.mark.asyncio
+    async def test_timeout_during_operation_registration_does_not_run_tool(
+        self,
+        monkeypatch,
+    ):
+        """Timeout while registering an operation must abandon the tool body."""
+        registration_started = threading.Event()
+        finish_registration = threading.Event()
+        executions = []
+        ended = []
+        semaphore = asyncio.Semaphore(1)
+        monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
+        monkeypatch.setattr(tool_base, "_TOOL_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "ensure_control",
+            lambda **_kwargs: ClaimResult(
+                acquired=True,
+                control={"control_role": "owner"},
+            ),
+        )
+
+        def slow_begin_operation():
+            """Hold operation registration beyond the client timeout."""
+            registration_started.set()
+            finish_registration.wait(timeout=1.0)
+            return True
+
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "begin_operation",
+            slow_begin_operation,
+        )
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "end_operation",
+            lambda: ended.append(True),
+        )
+
+        @_tool_handler("registering operation")
+        def guarded_tool():
+            """Record any execution after operation registration completes."""
+            executions.append("ran")
+            return "unexpected"
+
+        try:
+            result = json.loads(await guarded_tool())
+            assert registration_started.is_set()
+            assert "timed out" in result["message"]
+            assert semaphore.locked()
+        finally:
+            finish_registration.set()
+            for _ in range(50):
+                if not semaphore.locked():
+                    break
+                await asyncio.sleep(0.01)
+
+        assert not semaphore.locked()
+        assert executions == []
+        assert ended == [True]
+
+    @pytest.mark.asyncio
     async def test_control_release_status_probe_runs_off_event_loop(self, monkeypatch):
         """Released-control status probing should not block the event loop."""
         event_loop_thread = threading.get_ident()

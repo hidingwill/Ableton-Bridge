@@ -357,6 +357,71 @@ def test_release_refuses_active_operation(unused_tcp_port):
         manager.shutdown()
 
 
+def test_operation_registration_waits_for_backend_owner_phase(unused_tcp_port):
+    """Owner operations must not begin while backend activation is incomplete."""
+    startup_entered = threading.Event()
+    finish_startup = threading.Event()
+    claims = []
+
+    def start():
+        """Hold the manager in its starting phase for the assertion."""
+        startup_entered.set()
+        finish_startup.wait(timeout=1.0)
+
+    manager = _configured_manager(unused_tcp_port, start=start)
+    claimant = threading.Thread(
+        target=lambda: claims.append(manager.ensure_control()),
+    )
+    try:
+        claimant.start()
+        assert startup_entered.wait(timeout=1.0)
+        assert manager.begin_operation() is False
+
+        finish_startup.set()
+        claimant.join(timeout=1.0)
+        assert not claimant.is_alive()
+        assert claims[0].acquired is True
+        assert manager.release().released is True
+    finally:
+        finish_startup.set()
+        if claimant.ident is not None:
+            claimant.join(timeout=1.0)
+        manager.shutdown()
+
+
+def test_failed_start_retains_owner_while_operation_is_active(unused_tcp_port):
+    """Defensive failed-start cleanup must not hand off across a live operation."""
+    manager = None
+
+    def fail_with_active_operation():
+        """Inject an operation count that survived an abnormal startup path."""
+        with manager._lock:
+            manager._active_operations = 1
+        raise RuntimeError("activation failed")
+
+    manager = _configured_manager(
+        unused_tcp_port,
+        start=fail_with_active_operation,
+        stop=lambda: True,
+    )
+    contender = _configured_manager(unused_tcp_port)
+    try:
+        failed = manager.ensure_control()
+
+        assert failed.acquired is False
+        assert failed.control["control_role"] == "owner"
+        assert failed.control["active_operations"] == 1
+        assert "still running" in failed.error
+        assert contender.ensure_control().acquired is False
+
+        manager.end_operation()
+        assert manager.release().released is True
+        assert contender.ensure_control().acquired is True
+    finally:
+        manager.shutdown()
+        contender.shutdown()
+
+
 def test_release_cancels_cooperative_background_worker(
     unused_tcp_port,
 ):
