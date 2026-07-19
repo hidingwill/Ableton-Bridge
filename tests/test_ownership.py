@@ -292,6 +292,126 @@ def test_release_refuses_active_operation(unused_tcp_port):
         manager.shutdown()
 
 
+def test_release_cancels_cooperative_background_worker(
+    monkeypatch,
+    unused_tcp_port,
+):
+    """Cancellable owner services should not block an intentional handoff."""
+    import MCP_Server.server as server_module
+
+    stop_event = threading.Event()
+    started = threading.Event()
+    workers = []
+
+    def background(stop):
+        """Wait until backend teardown requests cancellation."""
+        started.set()
+        stop.wait(timeout=1.0)
+
+    def start():
+        """Start one representative owner background service."""
+        worker = threading.Thread(
+            target=server_module._run_control_background,
+            args=(background, stop_event),
+        )
+        workers.append(worker)
+        worker.start()
+
+    def stop():
+        """Cooperatively stop and join every background service."""
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=1.0)
+        return all(not worker.is_alive() for worker in workers)
+
+    manager = _configured_manager(unused_tcp_port, start=start, stop=stop)
+    monkeypatch.setattr(
+        server_module.ownership,
+        "begin_operation",
+        manager.begin_operation,
+    )
+    monkeypatch.setattr(server_module.ownership, "end_operation", manager.end_operation)
+    try:
+        assert manager.ensure_control().acquired is True
+        assert started.wait(timeout=1.0)
+        assert manager.status()["active_operations"] == 0
+
+        released = manager.release()
+
+        assert released.released is True
+        assert stop_event.is_set()
+        assert all(not worker.is_alive() for worker in workers)
+    finally:
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=1.0)
+        manager.shutdown()
+
+
+def test_release_retains_control_for_uncooperative_background_worker(
+    monkeypatch,
+    unused_tcp_port,
+):
+    """A service that ignores cancellation should retain ownership until stopped."""
+    import MCP_Server.server as server_module
+
+    stop_event = threading.Event()
+    started = threading.Event()
+    finish = threading.Event()
+    workers = []
+
+    def background(_stop):
+        """Ignore cooperative cancellation until explicitly released by the test."""
+        started.set()
+        finish.wait(timeout=1.0)
+
+    def start():
+        """Start one simulated stuck owner background service."""
+        worker = threading.Thread(
+            target=server_module._run_control_background,
+            args=(background, stop_event),
+        )
+        workers.append(worker)
+        worker.start()
+
+    def stop():
+        """Request cancellation and report whether the worker actually stopped."""
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=0.01)
+        return all(not worker.is_alive() for worker in workers)
+
+    owner = _configured_manager(unused_tcp_port, start=start, stop=stop)
+    standby = _configured_manager(unused_tcp_port)
+    monkeypatch.setattr(
+        server_module.ownership,
+        "begin_operation",
+        owner.begin_operation,
+    )
+    monkeypatch.setattr(server_module.ownership, "end_operation", owner.end_operation)
+    try:
+        assert owner.ensure_control().acquired is True
+        assert started.wait(timeout=1.0)
+
+        incomplete = owner.release()
+
+        assert incomplete.released is False
+        assert stop_event.is_set()
+        assert owner.status()["control_role"] == "owner"
+        assert standby.ensure_control().acquired is False
+
+        finish.set()
+        assert owner.release().released is True
+        assert standby.ensure_control().acquired is True
+    finally:
+        stop_event.set()
+        finish.set()
+        for worker in workers:
+            worker.join(timeout=1.0)
+        owner.shutdown()
+        standby.shutdown()
+
+
 def test_shutdown_retains_control_until_active_operation_finishes(unused_tcp_port):
     """Forced shutdown must retain the port while timed-out tool work remains."""
     stops = []

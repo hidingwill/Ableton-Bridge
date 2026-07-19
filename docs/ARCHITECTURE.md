@@ -260,7 +260,7 @@ Connection status is scoped to the calling MCP process. Only the owner has backe
 
 `features.m4l_bridge` mirrors the tri-state `m4l_connected` value: `true` or `false` for the owner and `null` for standby processes.
 
-Ownership has no idle timeout and cannot be stolen. Manual release is refused while a tool thread or owner background operation is still active, including work that outlived the MCP tool timeout. Forced shutdown signals cooperative cancellation, retains live thread and connection state after a join timeout, and keeps port `9881` until a later cleanup pass confirms that every owner resource stopped. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
+Ownership has no idle timeout and cannot be stolen. Manual release is refused while a foreground tool or controlled resource is still active, including work that outlived the MCP timeout. Owner background services such as M4L connection and browser warmup are cooperatively cancelled and joined during release; port `9881` remains owned if any worker fails to stop. Forced shutdown follows the same retention rule. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
 
 ## Command Delay Tiers
 

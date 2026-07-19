@@ -159,13 +159,8 @@ def _browser_cache_warmup(stop_event: threading.Event):
 # ===================================================================
 
 def _run_control_background(target, stop_event: threading.Event):
-    """Run owner-only background work and keep release safe while it is active."""
-    if not ownership.begin_operation():
-        return
-    try:
-        target(stop_event)
-    finally:
-        ownership.end_operation()
+    """Run cancellable owner-only background work."""
+    target(stop_event)
 
 
 def _start_control_backend():
