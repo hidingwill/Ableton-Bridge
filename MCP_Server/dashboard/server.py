@@ -161,7 +161,15 @@ def start_dashboard_server():
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard-http")
     state.dashboard_thread = thread
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        server.should_exit = True
+        if state.dashboard_server is server:
+            state.dashboard_server = None
+        if state.dashboard_thread is thread:
+            state.dashboard_thread = None
+        raise
     logger.info("Dashboard started at http://127.0.0.1:%d", state.DASHBOARD_PORT)
 
 

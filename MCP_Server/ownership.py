@@ -142,10 +142,28 @@ class OwnershipManager:
                     )
                 return ClaimResult(False, control, message)
 
+            owner = self._build_owner_metadata(client_name)
+            try:
+                responder_stop, responder_thread = (
+                    self._start_status_responder_locked(listener)
+                )
+            except Exception as exc:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+                logger.error("Ableton owner-status responder startup failed: %s", exc)
+                return ClaimResult(
+                    False,
+                    self.status(),
+                    f"Could not start the Ableton owner-status responder: {exc}",
+                )
+
             self._listener = listener
-            self._owner = self._build_owner_metadata(client_name)
+            self._owner = owner
             self._phase = "starting"
-            self._start_status_responder_locked()
+            self._responder_stop = responder_stop
+            self._responder_thread = responder_thread
             start_backend = self._start_backend
 
         try:
@@ -285,19 +303,24 @@ class OwnershipManager:
             listener.close()
             raise
 
-    def _start_status_responder_locked(self) -> None:
-        """Start the owner-status responder while local state is locked."""
-        assert self._listener is not None
+    def _start_status_responder_locked(
+        self,
+        listener: socket.socket,
+    ) -> tuple[threading.Event, threading.Thread]:
+        """Start an owner-status responder before publishing local state."""
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._serve_status,
-            args=(self._listener, stop_event),
+            args=(listener, stop_event),
             daemon=True,
             name="ableton-owner-status",
         )
-        self._responder_stop = stop_event
-        self._responder_thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            stop_event.set()
+            raise
+        return stop_event, thread
 
     def _serve_status(
         self,
@@ -450,7 +473,11 @@ class OwnershipManager:
                 except OSError:
                     pass
 
-        if responder is not None and responder is not threading.current_thread():
+        if (
+            responder is not None
+            and responder is not threading.current_thread()
+            and responder.ident is not None
+        ):
             responder.join(timeout=1.0)
 
         with self._lock:

@@ -137,6 +137,71 @@ def test_backend_start_failure_releases_port(unused_tcp_port):
         replacement.shutdown()
 
 
+def test_status_responder_start_failure_rolls_back_ownership(
+    monkeypatch,
+    unused_tcp_port,
+):
+    """A responder start exception must leave no local ownership to release."""
+    starts = []
+    stops = []
+    manager = _configured_manager(
+        unused_tcp_port,
+        start=lambda: starts.append(True),
+        stop=lambda: stops.append(True),
+    )
+
+    def fail_start(_thread):
+        """Fail before the responder thread reaches a started state."""
+        raise RuntimeError("thread creation unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+    result = manager.ensure_control()
+
+    assert result.acquired is False
+    assert "thread creation unavailable" in result.error
+    assert result.control["control_role"] == "standby"
+    assert result.control["control_availability"] == "available"
+    assert starts == []
+    assert stops == []
+    assert manager._listener is None
+    assert manager._owner is None
+    assert manager._responder_stop is None
+    assert manager._responder_thread is None
+    assert manager.release().released is False
+    manager.shutdown()
+
+
+def test_status_responder_start_failure_can_retry(monkeypatch, unused_tcp_port):
+    """A later claim on the same manager should retry responder startup."""
+    original_start = threading.Thread.start
+    attempts = []
+    starts = []
+    manager = _configured_manager(
+        unused_tcp_port,
+        start=lambda: starts.append(True),
+    )
+
+    def fail_once(thread):
+        """Fail only the first responder start, then use the real implementation."""
+        attempts.append(thread.name)
+        if len(attempts) == 1:
+            raise RuntimeError("transient thread failure")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_once)
+    try:
+        first = manager.ensure_control()
+        second = manager.ensure_control()
+
+        assert first.acquired is False
+        assert second.acquired is True
+        assert attempts == ["ableton-owner-status", "ableton-owner-status"]
+        assert starts == [True]
+    finally:
+        manager.shutdown()
+
+
 def test_failed_start_retains_port_until_partial_cleanup_finishes(unused_tcp_port):
     """Failed startup should retain ownership while cleanup remains incomplete."""
     cleanup_ready = {"value": False}
@@ -293,12 +358,9 @@ def test_release_refuses_active_operation(unused_tcp_port):
 
 
 def test_release_cancels_cooperative_background_worker(
-    monkeypatch,
     unused_tcp_port,
 ):
     """Cancellable owner services should not block an intentional handoff."""
-    import MCP_Server.server as server_module
-
     stop_event = threading.Event()
     started = threading.Event()
     workers = []
@@ -311,8 +373,8 @@ def test_release_cancels_cooperative_background_worker(
     def start():
         """Start one representative owner background service."""
         worker = threading.Thread(
-            target=server_module._run_control_background,
-            args=(background, stop_event),
+            target=background,
+            args=(stop_event,),
         )
         workers.append(worker)
         worker.start()
@@ -325,12 +387,6 @@ def test_release_cancels_cooperative_background_worker(
         return all(not worker.is_alive() for worker in workers)
 
     manager = _configured_manager(unused_tcp_port, start=start, stop=stop)
-    monkeypatch.setattr(
-        server_module.ownership,
-        "begin_operation",
-        manager.begin_operation,
-    )
-    monkeypatch.setattr(server_module.ownership, "end_operation", manager.end_operation)
     try:
         assert manager.ensure_control().acquired is True
         assert started.wait(timeout=1.0)
@@ -349,12 +405,9 @@ def test_release_cancels_cooperative_background_worker(
 
 
 def test_release_retains_control_for_uncooperative_background_worker(
-    monkeypatch,
     unused_tcp_port,
 ):
     """A service that ignores cancellation should retain ownership until stopped."""
-    import MCP_Server.server as server_module
-
     stop_event = threading.Event()
     started = threading.Event()
     finish = threading.Event()
@@ -368,8 +421,8 @@ def test_release_retains_control_for_uncooperative_background_worker(
     def start():
         """Start one simulated stuck owner background service."""
         worker = threading.Thread(
-            target=server_module._run_control_background,
-            args=(background, stop_event),
+            target=background,
+            args=(stop_event,),
         )
         workers.append(worker)
         worker.start()
@@ -383,12 +436,6 @@ def test_release_retains_control_for_uncooperative_background_worker(
 
     owner = _configured_manager(unused_tcp_port, start=start, stop=stop)
     standby = _configured_manager(unused_tcp_port)
-    monkeypatch.setattr(
-        server_module.ownership,
-        "begin_operation",
-        owner.begin_operation,
-    )
-    monkeypatch.setattr(server_module.ownership, "end_operation", owner.end_operation)
     try:
         assert owner.ensure_control().acquired is True
         assert started.wait(timeout=1.0)
@@ -523,6 +570,32 @@ def test_dashboard_shutdown_tolerates_unstarted_thread(monkeypatch):
     assert state.dashboard_thread is None
 
 
+def test_dashboard_start_failure_clears_published_state(monkeypatch):
+    """A failed dashboard thread start must not poison later owner cleanup."""
+    import MCP_Server.dashboard.server as dashboard
+    import MCP_Server.state as state
+
+    monkeypatch.setattr(state, "dashboard_server", None)
+    monkeypatch.setattr(state, "dashboard_thread", None)
+
+    def fail_start(_thread):
+        """Simulate a runtime failure before a dashboard thread starts."""
+        raise RuntimeError("cannot start thread")
+
+    monkeypatch.setattr(
+        dashboard.threading.Thread,
+        "start",
+        fail_start,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        dashboard.start_dashboard_server()
+
+    assert state.dashboard_server is None
+    assert state.dashboard_thread is None
+    assert dashboard.stop_dashboard_server() is True
+
+
 def test_dashboard_shutdown_retains_state_after_join_timeout(monkeypatch):
     """Dashboard state should remain published while its thread is alive."""
     import MCP_Server.state as state
@@ -620,6 +693,120 @@ def test_backend_shutdown_continues_past_unstarted_thread(monkeypatch):
     pending.join(timeout=1.0)
     assert cleanup[-1] == ("pending", True)
     assert server_module._stop_control_backend() is True
+    assert state.control_background_threads == []
+    assert state.control_stop_event is None
+
+
+def test_backend_start_failure_removes_unstarted_worker(monkeypatch):
+    """A worker start exception should leave only genuinely started workers."""
+    import MCP_Server.server as server_module
+    import MCP_Server.state as state
+
+    started = threading.Event()
+
+    def cooperative_worker(stop_event):
+        """Keep the first worker alive until rollback signals cancellation."""
+        started.set()
+        stop_event.wait(timeout=1.0)
+
+    original_start = threading.Thread.start
+
+    def fail_browser_start(thread):
+        """Start M4L normally, then fail the second owner-only worker."""
+        if thread.name == "browser-cache-warmup":
+            raise RuntimeError("worker thread unavailable")
+        return original_start(thread)
+
+    monkeypatch.setattr(server_module, "get_ableton_connection", lambda: None)
+    monkeypatch.setattr(server_module, "start_dashboard_server", lambda: None)
+    monkeypatch.setattr(server_module, "stop_dashboard_server", lambda: True)
+    monkeypatch.setattr(server_module, "_m4l_auto_connect", cooperative_worker)
+    monkeypatch.setattr(server_module, "_browser_cache_warmup", cooperative_worker)
+    monkeypatch.setattr(server_module.threading.Thread, "start", fail_browser_start)
+    monkeypatch.setattr(state, "ableton_connection", None)
+    monkeypatch.setattr(state, "m4l_connection", None)
+
+    with pytest.raises(RuntimeError, match="worker thread unavailable"):
+        server_module._start_control_backend()
+
+    assert started.wait(timeout=1.0)
+    assert [thread.name for thread in state.control_background_threads] == [
+        "m4l-auto-connect"
+    ]
+    assert server_module._stop_control_backend() is True
+    assert state.control_background_threads == []
+    assert state.control_stop_event is None
+
+
+def test_backend_shutdown_closes_m4l_published_during_join(monkeypatch):
+    """Teardown must close an M4L connection published after cancellation."""
+    import MCP_Server.server as server_module
+    import MCP_Server.state as state
+
+    second_check_sampled = threading.Event()
+
+    class CoordinatedStopEvent:
+        """Pause the worker after sampling a clear cancellation flag."""
+
+        def __init__(self):
+            self._event = threading.Event()
+            self._checks = 0
+
+        def is_set(self):
+            self._checks += 1
+            sampled = self._event.is_set()
+            if self._checks == 2:
+                second_check_sampled.set()
+                self._event.wait(timeout=1.0)
+            return sampled
+
+        def set(self):
+            self._event.set()
+
+        def wait(self, timeout=None):
+            return self._event.wait(timeout)
+
+    class FakeM4LConnection:
+        """Represent a bound M4L socket without touching the live ports."""
+
+        instance = None
+
+        def __init__(self):
+            self.disconnected = False
+            FakeM4LConnection.instance = self
+
+        def connect(self):
+            return True
+
+        def disconnect(self):
+            self.disconnected = True
+
+        @staticmethod
+        def _build_osc_message(_address, _args):
+            return b"ping"
+
+    stop_event = CoordinatedStopEvent()
+    worker = threading.Thread(
+        target=server_module._m4l_auto_connect,
+        args=(stop_event,),
+        name="late-m4l-publisher",
+    )
+    monkeypatch.setattr(server_module, "M4LConnection", FakeM4LConnection)
+    monkeypatch.setattr(server_module, "stop_dashboard_server", lambda: True)
+    monkeypatch.setattr(state, "control_stop_event", stop_event)
+    monkeypatch.setattr(state, "control_background_threads", [worker])
+    monkeypatch.setattr(state, "ableton_connection", None)
+    monkeypatch.setattr(state, "m4l_connection", None)
+    monkeypatch.setattr(state, "ableton_connected_event", threading.Event())
+
+    worker.start()
+    assert second_check_sampled.wait(timeout=1.0)
+
+    assert server_module._stop_control_backend() is True
+    assert not worker.is_alive()
+    assert FakeM4LConnection.instance is not None
+    assert FakeM4LConnection.instance.disconnected is True
+    assert state.m4l_connection is None
     assert state.control_background_threads == []
     assert state.control_stop_event is None
 

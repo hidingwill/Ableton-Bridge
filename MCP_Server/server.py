@@ -158,11 +158,6 @@ def _browser_cache_warmup(stop_event: threading.Event):
 # Control-owner backend lifecycle
 # ===================================================================
 
-def _run_control_background(target, stop_event: threading.Event):
-    """Run cancellable owner-only background work."""
-    target(stop_event)
-
-
 def _start_control_backend():
     """Start resources that must exist in exactly one MCP process."""
     logger.info("Starting Ableton control backend")
@@ -184,13 +179,21 @@ def _start_control_backend():
         (_browser_cache_warmup, "browser-cache-warmup"),
     ):
         thread = threading.Thread(
-            target=_run_control_background,
-            args=(target, stop_event),
+            target=target,
+            args=(stop_event,),
             daemon=True,
             name=name,
         )
         state.control_background_threads.append(thread)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            state.control_background_threads = [
+                worker
+                for worker in state.control_background_threads
+                if worker is not thread
+            ]
+            raise
 
 
 def _stop_control_backend() -> bool:
@@ -220,18 +223,6 @@ def _stop_control_backend() -> bool:
             if state.ableton_connection is ableton_connection:
                 state.ableton_connection = None
 
-    m4l_connection = state.m4l_connection
-    if m4l_connection:
-        logger.info("Disconnecting M4L bridge")
-        try:
-            m4l_connection.disconnect()
-        except Exception as exc:
-            cleanup_complete = False
-            logger.warning("M4L disconnect failed during release: %s", exc)
-        else:
-            if state.m4l_connection is m4l_connection:
-                state.m4l_connection = None
-
     remaining_threads = []
     for thread in list(state.control_background_threads):
         stopped = False
@@ -255,6 +246,21 @@ def _stop_control_backend() -> bool:
             )
 
     state.control_background_threads = remaining_threads
+
+    # M4L is published by its warmup worker, so re-read it only after joining
+    # workers. This catches a connection created just as cancellation began.
+    m4l_connection = state.m4l_connection
+    if m4l_connection:
+        logger.info("Disconnecting M4L bridge")
+        try:
+            m4l_connection.disconnect()
+        except Exception as exc:
+            cleanup_complete = False
+            logger.warning("M4L disconnect failed during release: %s", exc)
+        else:
+            if state.m4l_connection is m4l_connection:
+                state.m4l_connection = None
+
     if cleanup_complete:
         state.control_stop_event = None
     state.ableton_connected_event.clear()
