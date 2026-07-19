@@ -57,42 +57,58 @@ def build_connection_status(control: dict[str, Any]) -> dict[str, Any]:
 
 def get_m4l_status() -> tuple[bool, bool]:
     """Return local M4L socket readiness and cached bridge responsiveness."""
-    connection = state.m4l_connection
-    sockets_ready = bool(connection and connection._connected)
-    if not sockets_ready:
-        return False, False
-
-    now = time.time()
-    if now - state.m4l_ping_cache["timestamp"] < state.M4L_PING_CACHE_TTL:
-        return sockets_ready, state.m4l_ping_cache["result"]
-
     # A live ping may reconnect its UDP sockets. Protect it like any other
     # owner-local operation so manual release cannot tear the backend down
-    # underneath the status request. If release already started, report the
-    # last cached result without touching M4L.
+    # underneath the status request. The connection lock also makes a status
+    # ping atomic with normal-tool connection replacement.
     track_operation = ownership.is_configured()
     if track_operation and not ownership.begin_operation():
-        return sockets_ready, state.m4l_ping_cache["result"]
+        return _m4l_cached_snapshot()
 
     try:
-        connection = state.m4l_connection
-        sockets_ready = bool(connection and connection._connected)
-        if not sockets_ready:
-            return False, False
-
+        if not state.m4l_connection_lock.acquire(blocking=False):
+            return _m4l_cached_snapshot()
         try:
-            result = connection.ping()
-        except Exception as exc:
-            logger.debug("M4L status ping failed: %s", exc)
-            result = False
+            connection = state.m4l_connection
+            sockets_ready = bool(connection and connection._connected)
+            if not sockets_ready:
+                state.m4l_status_snapshot = (False, False)
+                return state.m4l_status_snapshot
 
-        if state.m4l_connection is connection:
-            state.m4l_ping_cache["result"] = result
+            now = time.time()
+            if now - state.m4l_ping_cache["timestamp"] < state.M4L_PING_CACHE_TTL:
+                state.m4l_status_snapshot = (
+                    sockets_ready,
+                    bool(state.m4l_ping_cache["result"]),
+                )
+                return state.m4l_status_snapshot
+
+            try:
+                result = connection.ping()
+            except Exception as exc:
+                logger.debug("M4L status ping failed: %s", exc)
+                result = False
+
+            # ping() may reconnect its UDP sockets. Re-read readiness after the
+            # probe so a failed reconnect cannot publish sockets_ready=True.
+            sockets_ready = bool(
+                state.m4l_connection is connection and connection._connected
+            )
+            connected = bool(result) if sockets_ready else False
+            state.m4l_ping_cache["result"] = connected
             state.m4l_ping_cache["timestamp"] = time.time()
-        return sockets_ready, result
+            state.m4l_status_snapshot = (sockets_ready, connected)
+            return state.m4l_status_snapshot
+        finally:
+            state.m4l_connection_lock.release()
     finally:
         if track_operation:
             ownership.end_operation()
+
+
+def _m4l_cached_snapshot() -> tuple[bool, bool]:
+    """Return a non-mutating M4L snapshot while lifecycle state is busy."""
+    return state.m4l_status_snapshot
 
 
 def _ableton_socket_connected() -> bool:

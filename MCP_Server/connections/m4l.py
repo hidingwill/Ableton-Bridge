@@ -672,44 +672,71 @@ def get_m4l_connection() -> M4LConnection:
     Always attempts a fresh connection if the existing one is dead.
     Uses a cached ping result to avoid a full UDP round trip on every call.
     """
-    # If we have a connected instance, verify it still works
-    if state.m4l_connection is not None and state.m4l_connection._connected:
-        # Use cached ping result if recent enough (avoids ~50-200ms round trip)
-        now = time.time()
-        if (now - state.m4l_ping_cache["timestamp"]) < state.M4L_PING_CACHE_TTL:
-            if state.m4l_ping_cache["result"]:
-                return state.m4l_connection
-        # Cache expired or stale, do a live ping
-        if state.m4l_connection.ping():
-            state.m4l_ping_cache["result"] = True
-            state.m4l_ping_cache["timestamp"] = now
-            return state.m4l_connection
-        # Ping failed -- tear down and try fresh
-        logger.warning("M4L bridge ping failed on existing connection, reconnecting...")
-        state.m4l_connection.disconnect()
-        state.m4l_connection = None
+    with state.m4l_connection_lock:
+        connection = state.m4l_connection
 
-    # Create a fresh connection
-    state.m4l_connection = M4LConnection()
-    if not state.m4l_connection.connect():
-        state.m4l_connection = None
-        raise ConnectionError(
-            "Could not initialise M4L bridge UDP sockets. "
-            "Check that port 9879 is not already in use."
-        )
+        # If we have a connected instance, verify it still works.
+        if connection is not None and connection._connected:
+            # Use cached ping result if recent enough (avoids ~50-200ms round trip)
+            now = time.time()
+            if (now - state.m4l_ping_cache["timestamp"]) < state.M4L_PING_CACHE_TTL:
+                if state.m4l_ping_cache["result"]:
+                    state.m4l_status_snapshot = (True, True)
+                    return connection
+            # Cache expired or stale, do a live ping.
+            if connection.ping():
+                state.m4l_ping_cache = {
+                    "result": True,
+                    "timestamp": time.time(),
+                }
+                state.m4l_status_snapshot = (True, True)
+                return connection
+            # Ping failed -- tear down and try fresh.
+            logger.warning("M4L bridge ping failed on existing connection, reconnecting...")
+            state.m4l_status_snapshot = (False, False)
+            connection.disconnect()
+            if state.m4l_connection is connection:
+                state.m4l_connection = None
+            state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
 
-    # Quick ping to verify the device is actually responding
-    if not state.m4l_connection.ping():
-        logger.warning("M4L UDP sockets ready but bridge device is not responding.")
-        # Keep the sockets open -- the device might be loaded later
-        # Don't tear down, so the next call can retry the ping
-        raise ConnectionError(
-            "M4L bridge device is not responding. "
-            "Make sure the AbletonBridge M4L device is loaded on a track in Ableton."
-        )
+        # Invalidate the observable generation before constructing a private
+        # replacement. Lock-free status readers can only see this coherent,
+        # pessimistic snapshot while the transaction is in progress.
+        state.m4l_status_snapshot = (False, False)
+        state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
 
-    logger.info("M4L bridge connection established and verified.")
-    return state.m4l_connection
+        # Create and connect privately before publishing the replacement.
+        connection = M4LConnection()
+        if not connection.connect():
+            raise ConnectionError(
+                "Could not initialise M4L bridge UDP sockets. "
+                "Check that port 9879 is not already in use."
+            )
+
+        state.m4l_connection = connection
+        state.m4l_status_snapshot = (True, False)
+
+        # Quick ping to verify the device is actually responding.
+        if not connection.ping():
+            state.m4l_ping_cache = {
+                "result": False,
+                "timestamp": time.time(),
+            }
+            state.m4l_status_snapshot = (bool(connection._connected), False)
+            logger.warning("M4L UDP sockets ready but bridge device is not responding.")
+            # Keep the sockets open -- the device might be loaded later.
+            raise ConnectionError(
+                "M4L bridge device is not responding. "
+                "Make sure the AbletonBridge M4L device is loaded on a track in Ableton."
+            )
+
+        state.m4l_ping_cache = {
+            "result": True,
+            "timestamp": time.time(),
+        }
+        state.m4l_status_snapshot = (True, True)
+        logger.info("M4L bridge connection established and verified.")
+        return connection
 
 
 def _m4l_batch_set_params(

@@ -262,6 +262,8 @@ Connection status is scoped to the calling MCP process. Only the owner has backe
 
 Ableton status is passive: it never sends or consumes protocol data. If a command owns the socket lock, status preserves the last verified socket result instead of interfering with the response stream. An expired M4L status cache may perform a live ping; that probe is registered as an owner operation, so release refuses rather than disconnecting or reconnecting M4L underneath it.
 
+M4L connection replacement, ping-cache updates, warmup publication, and teardown share `state.m4l_connection_lock`. A status request acquires this lock without waiting; if another connection transaction is active, it returns one immutable last-known snapshot instead of combining fields from different connection generations or probing a stale connection. The lock order is ownership operation, M4L state, then M4L socket.
+
 Ownership has no idle timeout and cannot be stolen. Manual release is refused while a foreground tool, controlled resource, or live status probe is active. A call that times out or is cancelled before its tool body starts is abandoned; an already-running worker keeps its operation lease until it exits. Owner background services such as M4L connection and browser warmup are cooperatively cancelled and joined during release; port `9881` remains owned if any worker fails to stop. Forced shutdown follows the same retention rule. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
 
 ## Command Delay Tiers

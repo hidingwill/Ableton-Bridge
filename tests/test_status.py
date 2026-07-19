@@ -123,6 +123,25 @@ def test_owner_distinguishes_m4l_sockets_from_bridge_response(monkeypatch):
     assert result["m4l_sockets_ready"] is True
 
 
+def test_m4l_status_rechecks_sockets_after_failed_ping_reconnect(monkeypatch):
+    """A ping that loses its sockets must not preserve pre-ping readiness."""
+    m4l = MagicMock(_connected=True)
+
+    def lose_sockets():
+        """Model send_command exhausting its reconnect attempt."""
+        m4l._connected = False
+        return False
+
+    m4l.ping.side_effect = lose_sockets
+    monkeypatch.setattr(state, "m4l_connection", m4l)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": False, "timestamp": 0.0})
+    monkeypatch.setattr(state, "m4l_status_snapshot", (True, False))
+    monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: False)
+
+    assert connection_status.get_m4l_status() == (False, False)
+    assert state.m4l_status_snapshot == (False, False)
+
+
 def test_live_m4l_status_probe_prevents_concurrent_release(
     monkeypatch,
     unused_tcp_port,
@@ -177,6 +196,7 @@ def test_m4l_status_does_not_ping_after_release_starts(monkeypatch):
     m4l = MagicMock(_connected=True)
     monkeypatch.setattr(state, "m4l_connection", m4l)
     monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 0.0})
+    monkeypatch.setattr(state, "m4l_status_snapshot", (True, True))
     monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: True)
     monkeypatch.setattr(connection_status.ownership, "begin_operation", lambda: False)
     monkeypatch.setattr(
@@ -187,6 +207,161 @@ def test_m4l_status_does_not_ping_after_release_starts(monkeypatch):
 
     assert connection_status.get_m4l_status() == (True, True)
     m4l.ping.assert_not_called()
+
+
+def test_status_ping_serializes_m4l_connection_replacement(monkeypatch):
+    """A status ping must finish before a normal tool replaces its connection."""
+    import MCP_Server.connections.m4l as m4l_module
+
+    ping_started = threading.Event()
+    finish_ping = threading.Event()
+    replacement_done = threading.Event()
+    status_results = []
+    replacement_results = []
+    calls = []
+    old = MagicMock(_connected=True)
+    new = MagicMock(_connected=True)
+    new.connect.return_value = True
+    new.ping.return_value = True
+
+    def old_ping():
+        """Block only the status ping; the replacement verification then fails."""
+        calls.append("ping")
+        if len(calls) == 1:
+            ping_started.set()
+            finish_ping.wait(timeout=1.0)
+        return False
+
+    def replace_connection():
+        """Run the normal connection replacement path in a competing thread."""
+        try:
+            replacement_results.append(m4l_module.get_m4l_connection())
+        finally:
+            replacement_done.set()
+
+    old.ping.side_effect = old_ping
+    monkeypatch.setattr(state, "m4l_connection", old)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": False, "timestamp": 0.0})
+    monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: False)
+    monkeypatch.setattr(m4l_module, "M4LConnection", lambda: new)
+
+    status_worker = threading.Thread(
+        target=lambda: status_results.append(connection_status.get_m4l_status()),
+    )
+    replacement_worker = threading.Thread(target=replace_connection)
+    try:
+        status_worker.start()
+        assert ping_started.wait(timeout=1.0)
+
+        replacement_worker.start()
+        assert replacement_done.wait(timeout=0.05) is False
+        assert state.m4l_connection is old
+
+        finish_ping.set()
+        status_worker.join(timeout=1.0)
+        replacement_worker.join(timeout=1.0)
+
+        assert not status_worker.is_alive()
+        assert not replacement_worker.is_alive()
+        assert status_results == [(True, False)]
+        assert replacement_results == [new]
+        assert state.m4l_connection is new
+        assert old.disconnect.call_count == 1
+        assert state.m4l_ping_cache["result"] is True
+        assert state.m4l_ping_cache["timestamp"] > 0.0
+    finally:
+        finish_ping.set()
+        if status_worker.ident is not None:
+            status_worker.join(timeout=1.0)
+        if replacement_worker.ident is not None:
+            replacement_worker.join(timeout=1.0)
+
+
+def test_m4l_status_uses_cache_while_connection_transaction_is_busy(monkeypatch):
+    """Status should remain responsive instead of waiting for M4L replacement."""
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    status_done = threading.Event()
+    results = []
+    m4l = MagicMock(_connected=True)
+    monkeypatch.setattr(state, "m4l_connection", m4l)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 0.0})
+    monkeypatch.setattr(state, "m4l_status_snapshot", (True, True))
+    monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: False)
+
+    def hold_connection_transaction():
+        """Keep the state lock busy until status has taken its fallback path."""
+        with state.m4l_connection_lock:
+            lock_held.set()
+            release_lock.wait(timeout=1.0)
+
+    def read_status():
+        """Record completion without ever waiting for the held state lock."""
+        try:
+            results.append(connection_status.get_m4l_status())
+        finally:
+            status_done.set()
+
+    holder = threading.Thread(target=hold_connection_transaction)
+    reader = threading.Thread(target=read_status)
+    try:
+        holder.start()
+        assert lock_held.wait(timeout=1.0)
+        reader.start()
+
+        assert status_done.wait(timeout=0.2)
+        assert results == [(True, True)]
+        m4l.ping.assert_not_called()
+    finally:
+        release_lock.set()
+        if holder.ident is not None:
+            holder.join(timeout=1.0)
+        if reader.ident is not None:
+            reader.join(timeout=1.0)
+
+
+def test_m4l_status_fallback_never_combines_connection_generations(monkeypatch):
+    """A busy transaction exposes one immutable snapshot, never hybrid state."""
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    status_done = threading.Event()
+    results = []
+    new_connection = MagicMock(_connected=True)
+    monkeypatch.setattr(state, "m4l_connection", None)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 1.0})
+    monkeypatch.setattr(state, "m4l_status_snapshot", (False, False))
+    monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: False)
+
+    def publish_partial_generation():
+        """Pause on deliberately inconsistent raw fields inside the state lock."""
+        with state.m4l_connection_lock:
+            state.m4l_connection = new_connection
+            lock_held.set()
+            release_lock.wait(timeout=1.0)
+
+    def read_status():
+        """Read the last atomic snapshot without inspecting partial fields."""
+        try:
+            results.append(connection_status.get_m4l_status())
+        finally:
+            status_done.set()
+
+    publisher = threading.Thread(target=publish_partial_generation)
+    reader = threading.Thread(target=read_status)
+    try:
+        publisher.start()
+        assert lock_held.wait(timeout=1.0)
+        reader.start()
+
+        assert status_done.wait(timeout=0.2)
+        assert results == [(False, False)]
+        new_connection.ping.assert_not_called()
+    finally:
+        release_lock.set()
+        if publisher.ident is not None:
+            publisher.join(timeout=1.0)
+        if reader.ident is not None:
+            reader.join(timeout=1.0)
 
 
 @pytest.mark.asyncio

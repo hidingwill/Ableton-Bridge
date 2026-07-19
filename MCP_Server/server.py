@@ -61,17 +61,27 @@ def _m4l_auto_connect(stop_event: threading.Event):
     if stop_event.is_set():
         return
 
-    # Create sockets once — don't tear them down between retries
-    conn = M4LConnection()
-    if not conn.connect():
-        logger.warning("M4L auto-connect: could not bind UDP sockets")
-        return
-
-    if stop_event.is_set():
-        conn.disconnect()
-        return
-
-    state.m4l_connection = conn
+    # Publish one connection-and-cache generation atomically. Normal tools use
+    # the same lock when verifying or replacing this connection.
+    with state.m4l_connection_lock:
+        if stop_event.is_set():
+            return
+        if state.m4l_connection is not None:
+            conn = state.m4l_connection
+            if not conn._connected:
+                return
+        else:
+            state.m4l_status_snapshot = (False, False)
+            state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
+            conn = M4LConnection()
+            if not conn.connect():
+                logger.warning("M4L auto-connect: could not bind UDP sockets")
+                return
+            if stop_event.is_set():
+                conn.disconnect()
+                return
+            state.m4l_connection = conn
+            state.m4l_status_snapshot = (True, False)
 
     # Build a raw OSC ping packet
     ping_id = "autocon"
@@ -81,24 +91,33 @@ def _m4l_auto_connect(stop_event: threading.Event):
         if stop_event.is_set():
             return
         try:
-            # Drain stale data
-            conn._drain_recv_socket()
-            conn.recv_sock.settimeout(2.0)
+            with state.m4l_connection_lock:
+                if stop_event.is_set() or state.m4l_connection is not conn:
+                    return
+                with conn._send_lock:
+                    # Drain stale data
+                    conn._drain_recv_socket()
+                    conn.recv_sock.settimeout(2.0)
 
-            # Send ping
-            conn.send_sock.sendto(ping_osc, (conn.send_host, conn.send_port))
+                    # Send ping
+                    conn.send_sock.sendto(ping_osc, (conn.send_host, conn.send_port))
 
-            # Wait for response
-            data, _addr = conn.recv_sock.recvfrom(65535)
-            result = conn._parse_m4l_response(data)
-            if result.get("status") == "success":
-                logger.info("M4L bridge auto-connected on attempt %d", attempt)
-                state.m4l_ping_cache["result"] = True
-                state.m4l_ping_cache["timestamp"] = time.time()
-                # Check bridge version compatibility
-                M4LConnection._check_bridge_version(result)
-                return
+                    # Wait for response
+                    data, _addr = conn.recv_sock.recvfrom(65535)
+                    result = conn._parse_m4l_response(data)
+                if result.get("status") == "success":
+                    logger.info("M4L bridge auto-connected on attempt %d", attempt)
+                    state.m4l_ping_cache = {
+                        "result": True,
+                        "timestamp": time.time(),
+                    }
+                    state.m4l_status_snapshot = (True, True)
+                    # Check bridge version compatibility
+                    M4LConnection._check_bridge_version(result)
+                    return
         except TimeoutError:
+            if stop_event.is_set():
+                return
             logger.info(
                 "M4L auto-connect %d/15: no response (timeout), retrying...",
                 attempt,
@@ -249,22 +268,24 @@ def _stop_control_backend() -> bool:
 
     # M4L is published by its warmup worker, so re-read it only after joining
     # workers. This catches a connection created just as cancellation began.
-    m4l_connection = state.m4l_connection
-    if m4l_connection:
-        logger.info("Disconnecting M4L bridge")
-        try:
-            m4l_connection.disconnect()
-        except Exception as exc:
-            cleanup_complete = False
-            logger.warning("M4L disconnect failed during release: %s", exc)
-        else:
-            if state.m4l_connection is m4l_connection:
-                state.m4l_connection = None
+    with state.m4l_connection_lock:
+        state.m4l_status_snapshot = (False, False)
+        m4l_connection = state.m4l_connection
+        if m4l_connection:
+            logger.info("Disconnecting M4L bridge")
+            try:
+                m4l_connection.disconnect()
+            except Exception as exc:
+                cleanup_complete = False
+                logger.warning("M4L disconnect failed during release: %s", exc)
+            else:
+                if state.m4l_connection is m4l_connection:
+                    state.m4l_connection = None
+        state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
 
     if cleanup_complete:
         state.control_stop_event = None
     state.ableton_connected_event.clear()
-    state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
     return cleanup_complete
 
 

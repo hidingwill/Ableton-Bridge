@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 ableton_connection: Optional[Any] = None  # AbletonConnection | None
 m4l_connection: Optional[Any] = None      # M4LConnection | None
+m4l_connection_lock: threading.RLock = threading.RLock()
+m4l_status_snapshot: tuple[bool, bool] = (False, False)
 
 # ---------------------------------------------------------------------------
 # Feature stores (in-memory, lost on restart)
