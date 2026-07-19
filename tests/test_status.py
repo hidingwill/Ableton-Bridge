@@ -1,12 +1,14 @@
 """Ownership-aware connection status tests."""
 
 import json
+import threading
 from unittest.mock import MagicMock
 
 import pytest
 
 import MCP_Server.state as state
 import MCP_Server.status as connection_status
+from MCP_Server.ownership import OwnershipManager
 
 
 def _control(role: str, availability: str) -> dict:
@@ -119,6 +121,72 @@ def test_owner_distinguishes_m4l_sockets_from_bridge_response(monkeypatch):
     assert result["m4l_connection_state"] == "sockets_ready"
     assert result["m4l_connected"] is False
     assert result["m4l_sockets_ready"] is True
+
+
+def test_live_m4l_status_probe_prevents_concurrent_release(
+    monkeypatch,
+    unused_tcp_port,
+):
+    """Release must not disconnect M4L while an owner status ping is active."""
+    manager = OwnershipManager(unused_tcp_port)
+    manager.configure_backend(lambda: None, lambda: True)
+    started = threading.Event()
+    finish = threading.Event()
+    results = []
+    m4l = MagicMock(_connected=True)
+
+    def blocking_ping():
+        """Hold the status probe until release has observed the operation."""
+        started.set()
+        finish.wait(timeout=1.0)
+        return True
+
+    m4l.ping.side_effect = blocking_ping
+    monkeypatch.setattr(state, "m4l_connection", m4l)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": False, "timestamp": 0.0})
+    monkeypatch.setattr(connection_status.ownership, "is_configured", manager.is_configured)
+    monkeypatch.setattr(connection_status.ownership, "begin_operation", manager.begin_operation)
+    monkeypatch.setattr(connection_status.ownership, "end_operation", manager.end_operation)
+
+    worker = threading.Thread(
+        target=lambda: results.append(connection_status.get_m4l_status()),
+    )
+    try:
+        assert manager.ensure_control().acquired is True
+        worker.start()
+        assert started.wait(timeout=1.0)
+
+        release = manager.release()
+        assert release.released is False
+        assert release.control["active_operations"] == 1
+
+        finish.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert results == [(True, True)]
+        assert manager.release().released is True
+    finally:
+        finish.set()
+        if worker.ident is not None:
+            worker.join(timeout=1.0)
+        manager.shutdown()
+
+
+def test_m4l_status_does_not_ping_after_release_starts(monkeypatch):
+    """A failed operation lease should fall back to the last cached result."""
+    m4l = MagicMock(_connected=True)
+    monkeypatch.setattr(state, "m4l_connection", m4l)
+    monkeypatch.setattr(state, "m4l_ping_cache", {"result": True, "timestamp": 0.0})
+    monkeypatch.setattr(connection_status.ownership, "is_configured", lambda: True)
+    monkeypatch.setattr(connection_status.ownership, "begin_operation", lambda: False)
+    monkeypatch.setattr(
+        connection_status.ownership,
+        "end_operation",
+        lambda: pytest.fail("unacquired operation was ended"),
+    )
+
+    assert connection_status.get_m4l_status() == (True, True)
+    m4l.ping.assert_not_called()
 
 
 @pytest.mark.asyncio
