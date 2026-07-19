@@ -7,7 +7,7 @@ from MCP_Server.connections.m4l import get_m4l_connection
 from MCP_Server.validation import _validate_index, _validate_index_allow_negative, _validate_range
 import MCP_Server.state as state
 import MCP_Server.ownership as ownership
-from MCP_Server.dashboard.server import get_m4l_status
+from MCP_Server.status import build_connection_status
 
 
 def register_tools(mcp):
@@ -16,26 +16,20 @@ def register_tools(mcp):
     @mcp.tool()
     @_tool_handler("getting server capabilities", requires_control=False)
     def get_server_capabilities(ctx: Context) -> str:
-        """Report server version, connection status, available feature sets, and tool count.
+        """Report server version, ownership-aware connections, features, and tools.
 
         Call this first in any session to understand what features are available.
-        Returns JSON with connection status, M4L availability, browser cache state, etc.
+        Owner connection booleans are true or false. Standby connection booleans
+        are null, with explicit connection-state fields explaining why.
         """
         from MCP_Server import __version__
-        m4l_sockets_ready, m4l_connected = get_m4l_status()
-        ableton_connected = bool(state.ableton_connection and state.ableton_connection.sock)
-        try:
-            if ableton_connected:
-                state.ableton_connection.sock.getpeername()
-        except Exception:
-            ableton_connected = False
+        control = ownership.get_status()
+        connections = build_connection_status(control)
 
         return json.dumps({
             "server_version": __version__,
-            **ownership.get_status(),
-            "ableton_connected": ableton_connected,
-            "m4l_connected": m4l_connected,
-            "m4l_sockets_ready": m4l_sockets_ready,
+            **control,
+            **connections,
             "browser_cache_ready": state.browser_cache_ready.is_set(),
             "browser_cache_items": len(state.browser_cache_flat),
             "tool_count": len(mcp._tool_manager._tools) if hasattr(mcp, '_tool_manager') else 0,
@@ -45,7 +39,7 @@ def register_tools(mcp):
                 "macros": True,
                 "param_maps": True,
                 "dashboard": state.dashboard_server is not None,
-                "m4l_bridge": m4l_connected,
+                "m4l_bridge": connections["m4l_connected"],
             },
             "store_counts": {
                 "snapshots": len(state.snapshot_store),

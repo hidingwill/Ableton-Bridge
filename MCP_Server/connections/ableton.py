@@ -1,8 +1,9 @@
 """AbletonConnection — TCP socket connection to the Ableton Remote Script."""
 
-import socket
 import json
 import logging
+import select
+import socket
 import time
 import threading
 from dataclasses import dataclass
@@ -79,6 +80,40 @@ class AbletonConnection:
         """Initialize per-connection receive buffering and send serialization."""
         self._recv_buffer = ""
         self._send_lock = threading.Lock()
+
+    def is_connected(self) -> bool:
+        """Passively check whether the Remote Script socket is still open.
+
+        The check never sends or consumes protocol data. If a command currently
+        owns the send lock, the established socket is treated as connected so a
+        status request cannot interfere with its response handling.
+        """
+        sock = self.sock
+        if sock is None:
+            return False
+
+        try:
+            sock.getpeername()
+        except OSError:
+            return False
+
+        if not self._send_lock.acquire(blocking=False):
+            return True
+
+        try:
+            readable, _writable, _exceptional = select.select([sock], [], [], 0)
+            if not readable:
+                return True
+            try:
+                return bool(sock.recv(1, socket.MSG_PEEK))
+            except (BlockingIOError, socket.timeout):
+                return True
+            except OSError:
+                return False
+        except (OSError, ValueError):
+            return False
+        finally:
+            self._send_lock.release()
 
     def _ensure_udp_socket(self):
         """Create a UDP socket for real-time parameter sending if not already open."""
@@ -290,11 +325,8 @@ def get_ableton_connection():
 
     if state.ableton_connection is not None:
         try:
-            # Test if the socket is still connected
-            if state.ableton_connection.sock is None:
-                raise ConnectionError("Socket is None")
-            state.ableton_connection.sock.settimeout(1.0)
-            state.ableton_connection.sock.getpeername()  # raises if disconnected
+            if not state.ableton_connection.is_connected():
+                raise ConnectionError("Socket is no longer connected")
             return state.ableton_connection
         except Exception as e:
             logger.warning("Existing connection is no longer valid: %s", e)

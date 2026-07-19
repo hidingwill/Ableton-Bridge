@@ -9,7 +9,7 @@ AbletonBridge provides 347 tools for controlling Ableton Live sessions. This gui
 
 ## Startup
 
-Call get_server_capabilities first in every session. It reports control_role, control_availability, owner process metadata, connection state, browser cache state, and tool count. This status call does not claim control.
+Call get_server_capabilities first in every session. It reports control_role, control_availability, owner process metadata, connection state, browser cache state, and tool count. This status call does not claim control. Connection booleans are true or false only for the owner; a standby reports null because its backend is not running locally. Interpret ableton_connection_state and m4l_connection_state instead: not_started means the first normal tool can attempt to claim and connect, owned_elsewhere means another task owns control and its connection health is not visible here, and unknown means port 9881 is occupied by an unrelated process.
 
 The first normal Ableton tool call automatically claims control when control_availability is "available". If another task owns control, tools return a structured ownership error instead of disappearing. Ask the owning task to call release_ableton_control when an intentional handoff is needed. Never assume control can be stolen or released by a standby task.
 
@@ -85,7 +85,7 @@ Drum pattern tools (generate_euclidean_rhythm, generate_drum_pattern) use standa
 
 ## M4L Bridge
 
-Check m4l_connected from get_server_capabilities before calling any M4L tool. If false, use standard get_device_parameters / set_device_parameter instead.
+When this task owns control, check m4l_connected from get_server_capabilities before calling any M4L tool. If false, use standard get_device_parameters / set_device_parameter instead. A standby value of null does not mean the M4L bridge is disconnected; inspect m4l_connection_state and ownership first.
 
 Key M4L subsystems:
 - **Note surgery**: get_clip_notes_with_ids → modify_clip_notes / remove_clip_notes_by_id for in-place, non-destructive editing (Live 11+).

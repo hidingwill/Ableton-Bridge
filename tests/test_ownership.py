@@ -590,6 +590,11 @@ async def test_two_stdio_clients_keep_tools_while_control_is_owned(unused_tcp_po
                             assert status["control_role"] == "standby"
                             assert status["control_availability"] == "owned"
                             assert status["owner"]["client_name"] == "integration-owner"
+                            assert status["ableton_connection_state"] == "owned_elsewhere"
+                            assert status["ableton_connected"] is None
+                            assert status["m4l_connection_state"] == "owned_elsewhere"
+                            assert status["m4l_connected"] is None
+                            assert status["m4l_sockets_ready"] is None
 
                             release_result = await client_b.call_tool("release_ableton_control", {})
                             release = json.loads(release_result.content[0].text)
@@ -598,3 +603,48 @@ async def test_two_stdio_clients_keep_tools_while_control_is_owned(unused_tcp_po
                             assert owner.status()["control_role"] == "owner"
     finally:
         owner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stdio_status_reports_unstarted_backend_without_claiming(
+    unused_tcp_port_factory,
+):
+    """A free standby should report null connections and leave control free."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    lock_port = unused_tcp_port_factory()
+    dashboard_port = unused_tcp_port_factory()
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["ABLETON_BRIDGE_LOCK_PORT"] = str(lock_port)
+    env["ABLETON_BRIDGE_DASHBOARD_PORT"] = str(dashboard_port)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "MCP_Server.server"],
+        cwd=root,
+        env=env,
+    )
+
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        async with stdio_client(params, errlog=errors) as (read, write):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                tools = await client.list_tools()
+                status_result = await client.call_tool("get_server_capabilities", {})
+                status = json.loads(status_result.content[0].text)
+
+                assert len(tools.tools) > 300
+                assert status["control_role"] == "standby"
+                assert status["control_availability"] == "available"
+                assert status["ableton_connection_state"] == "not_started"
+                assert status["ableton_connected"] is None
+                assert status["m4l_connection_state"] == "not_started"
+                assert status["m4l_connected"] is None
+                assert status["m4l_sockets_ready"] is None
+
+                contender = _configured_manager(lock_port)
+                try:
+                    assert contender.ensure_control().acquired is True
+                finally:
+                    contender.shutdown()

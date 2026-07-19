@@ -123,12 +123,60 @@ class TestAbletonConnectionSendCommand:
         assert exc_info.value.__suppress_context__ is True
 
 
+class TestAbletonConnectionLiveness:
+    def test_open_peer_is_connected(self):
+        """An open idle peer should remain connected without receiving data."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            assert connection.is_connected() is True
+        finally:
+            client.close()
+            server.close()
+
+    def test_closed_peer_is_disconnected(self):
+        """A clean peer shutdown should be visible without sending a command."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.shutdown(socket.SHUT_RDWR)
+            server.close()
+            assert connection.is_connected() is False
+        finally:
+            client.close()
+
+    def test_liveness_check_does_not_consume_pending_data(self):
+        """Peeking at a readable socket must leave protocol bytes untouched."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.sendall(b"response")
+            assert connection.is_connected() is True
+            assert client.recv(8) == b"response"
+        finally:
+            client.close()
+            server.close()
+
+    def test_busy_connection_is_not_disturbed(self):
+        """Status should not wait for a command that owns the send lock."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        connection._send_lock.acquire()
+        try:
+            assert connection.is_connected() is True
+            assert connection._send_lock.locked()
+        finally:
+            connection._send_lock.release()
+            client.close()
+            server.close()
+
+
 class TestGetAbletonConnection:
     def test_returns_existing_valid_connection(self):
         """Should return existing connection if socket is valid."""
         mock_conn = MagicMock()
         mock_conn.sock = MagicMock()
-        mock_conn.sock.getpeername.return_value = ("localhost", 9877)
+        mock_conn.is_connected.return_value = True
         mock_conn.send_command.return_value = {"status": "success"}
         state.ableton_connection = mock_conn
         with patch('MCP_Server.connections.ableton.AbletonConnection'):
@@ -139,7 +187,7 @@ class TestGetAbletonConnection:
         """Should create new connection if existing socket is dead."""
         mock_conn = MagicMock()
         mock_conn.sock = MagicMock()
-        mock_conn.sock.getpeername.side_effect = socket.error("not connected")
+        mock_conn.is_connected.return_value = False
         state.ableton_connection = mock_conn
         new_conn = MagicMock()
         new_conn.connect.return_value = True

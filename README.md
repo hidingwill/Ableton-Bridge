@@ -58,7 +58,7 @@ MCP Server (modular architecture):
 
 Every MCP client receives the complete tool set, while one local process owns Ableton control at a time:
 
-- `get_server_capabilities` reports whether this process is the owner or a standby, plus owner process metadata when available.
+- `get_server_capabilities` reports whether this process is the owner or a standby, plus owner process metadata when available. Connection booleans are `true` or `false` only for the owner; standbys return `null` with `not_started`, `owned_elsewhere`, or `unknown` connection states so an unstarted local backend is never mistaken for a disconnected Live instance.
 - The first normal Ableton tool call automatically claims control when it is free.
 - Standby tools return a structured ownership error instead of terminating the MCP server.
 - `release_ableton_control` hands control back explicitly. Ownership is also released when the owning MCP process shuts down.

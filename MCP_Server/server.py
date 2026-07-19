@@ -30,6 +30,7 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 import MCP_Server.state as state
 import MCP_Server.ownership as ownership
+from MCP_Server.status import build_connection_status
 from MCP_Server.connections.ableton import get_ableton_connection
 from MCP_Server.connections.m4l import M4LConnection
 from MCP_Server.cache.browser import load_browser_cache_from_disk, populate_browser_cache
@@ -372,14 +373,14 @@ def _run_controlled_resource(command: str) -> str:
 
 @mcp.resource("ableton://capabilities")
 def resource_capabilities() -> str:
-    """Server capabilities, connection status, and version info."""
+    """Return version, ownership, and role-aware connection status."""
     import json
     from MCP_Server import __version__
+    control = ownership.get_status()
     result = {
         "server_version": __version__,
-        **ownership.get_status(),
-        "ableton_connected": bool(state.ableton_connection and state.ableton_connection.sock),
-        "m4l_connected": bool(state.m4l_connection and state.m4l_connection._connected),
+        **control,
+        **build_connection_status(control),
         "m4l_bridge_version": state.m4l_bridge_version or "unknown",
         "browser_cache_ready": state.browser_cache_ready.is_set(),
         "browser_cache_items": len(state.browser_cache_flat),

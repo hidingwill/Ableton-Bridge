@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import MCP_Server.state as state
+import MCP_Server.ownership as ownership
 from MCP_Server.dashboard.html import DASHBOARD_HTML
+from MCP_Server.status import build_connection_status
 
 logger = logging.getLogger("AbletonBridge")
 
@@ -73,38 +75,9 @@ def get_server_version() -> str:
         return __version__
 
 
-def get_m4l_status() -> tuple:
-    """Return (sockets_ready, bridge_responding) with cached ping."""
-    sockets_ready = bool(state.m4l_connection and state.m4l_connection._connected)
-    if not sockets_ready:
-        return False, False
-
-    now = time.time()
-    if now - state.m4l_ping_cache["timestamp"] < state.M4L_PING_CACHE_TTL:
-        return sockets_ready, state.m4l_ping_cache["result"]
-
-    try:
-        result = state.m4l_connection.ping()
-    except Exception as e:
-        logger.debug("Dashboard M4L ping failed: %s", e)
-        result = False
-
-    state.m4l_ping_cache["result"] = result
-    state.m4l_ping_cache["timestamp"] = now
-    return sockets_ready, result
-
-
 def build_status_json() -> dict:
     """Collect all dashboard status data into a JSON-serializable dict."""
-    ableton_connected = False
-    if state.ableton_connection and state.ableton_connection.sock:
-        try:
-            state.ableton_connection.sock.getpeername()
-            ableton_connected = True
-        except Exception:
-            pass
-
-    m4l_sockets_ready, m4l_connected = get_m4l_status()
+    connections = build_connection_status(ownership.get_status())
 
     with state.tool_call_lock:
         recent = list(state.tool_call_log)
@@ -125,9 +98,7 @@ def build_status_json() -> dict:
     return {
         "version": get_server_version(),
         "uptime_seconds": round(time.time() - state.server_start_time, 1) if state.server_start_time else 0,
-        "ableton_connected": ableton_connected,
-        "m4l_connected": m4l_connected,
-        "m4l_sockets_ready": m4l_sockets_ready,
+        **connections,
         "store_counts": {
             "snapshots": len(state.snapshot_store),
             "macros": len(state.macro_store),

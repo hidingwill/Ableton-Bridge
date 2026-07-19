@@ -63,6 +63,8 @@ MCP_Server/
 ├── ownership.py             # Cross-process Ableton control coordination
 │                            #   - atomic owner lock + status responder (:9881)
 │                            #   - owner metadata, release, active-operation tracking
+├── status.py                # Ownership-aware Ableton and M4L connection status
+│                            #   - tri-state standby fields, passive owner checks
 ├── state.py                 # ALL global mutable state
 │                            #   - connections, stores, caches, locks
 │                            #   - threading events, config, MCP instance ref
@@ -85,6 +87,7 @@ MCP_Server/
 │   ├── ableton.py           # AbletonConnection (TCP :9877)
 │   │                        #   - tiered send_command() with per-tier delays
 │   │                        #   - NON_IDEMPOTENT_COMMANDS (no retry for create/delete)
+│   │                        #   - passive socket liveness without consuming data
 │   │                        #   - get_ableton_connection() singleton
 │   └── m4l.py               # M4LConnection (UDP/OSC :9878/:9879)
 │                             #   - OSC message building, chunked response reassembly
@@ -165,20 +168,21 @@ Level 0 (no internal imports):
 
 Level 1 (imports Level 0 only):
   ownership.py            →  state
+  status.py               →  state
   connections/ableton.py  →  state, constants
   connections/m4l.py      →  state
 
 Level 2 (imports Levels 0-1):
   cache/browser.py        →  state, constants, connections.ableton
-  dashboard/server.py     →  state, connections.ableton
+  dashboard/server.py     →  state, ownership, status
   tools/_base.py          →  ownership
 
 Level 3 (imports Levels 0-2):
-  tools/*.py              →  _base, connections, validation, state, cache
+  tools/*.py              →  _base, connections, validation, state, status, cache
   prompts.py              →  (standalone: just receives mcp instance)
 
 Level 4 (imports everything):
-  server.py               →  state, connections, cache, dashboard, tools, prompts, instructions
+  server.py               →  state, ownership, status, connections, cache, dashboard, tools, prompts, instructions
 ```
 
 **Rule:** No module at Level N imports from Level N or higher. This prevents circular imports.
@@ -234,12 +238,27 @@ MCP stdio connections are process-private: clients such as Codex may launch one 
 | MCP process starts | Registers all tools immediately and begins in `standby` without connecting to Live. |
 | First normal tool call | Atomically binds loopback port `9881`, starts the backend resources, and becomes `owner`. |
 | Another process already owns `9881` | Remains healthy in `standby`; tools return a structured ownership error instead of terminating MCP initialization. |
-| Status call | `get_server_capabilities` reports `control_role`, `control_availability`, active operations, and best-effort owner process/task metadata without claiming control. |
+| Status call | `get_server_capabilities` reports ownership plus role-aware connection states without claiming control. Owner connection booleans are verified locally; standby values are `null`. |
 | Explicit release | `release_ableton_control` closes `9881` only after every owner resource has stopped; incomplete cleanup returns `released: false` and retains ownership for a safe retry. |
 | MCP shutdown | Performs the same release automatically. |
-| Backend startup fails | Cleans up partial resources and releases `9881` only after cleanup is confirmed; otherwise ownership is retained until release can be retried safely. |
+| Backend startup fails | MCP remains healthy in standby, but owner-only services do not start. Partial resources are cleaned up and `9881` is released only after cleanup is confirmed. |
 
 The `9881` owner socket also serves a loopback-only JSON status response. Reusing the lock socket avoids a stale metadata file or another management port. If an unrelated process occupies the port, availability is reported as `occupied_unknown`.
+
+Connection status is scoped to the calling MCP process. Only the owner has backend sockets it can inspect, so standby processes never report `false` for Ableton or M4L connectivity:
+
+| Control state | Connection state | Connection booleans |
+|---------------|------------------|---------------------|
+| Standby, control available | `not_started` | `null` |
+| Standby, known AbletonBridge owner | `owned_elsewhere` | `null` |
+| Standby, unknown port occupant | `unknown` | `null` |
+| Owner, healthy local connection | `connected` | `true` |
+| Owner, failed local connection | `disconnected` | `false` |
+| Owner, M4L sockets awaiting a bridge response | `sockets_ready` | M4L connected `false` |
+
+`null` means the local backend is absent and the connection cannot be evaluated from this process. It does not mean Live is disconnected. Remote-owner health is intentionally not added to the `9881` responder, avoiding stale distributed health state and preserving the ownership protocol.
+
+`features.m4l_bridge` mirrors the tri-state `m4l_connected` value: `true` or `false` for the owner and `null` for standby processes.
 
 Ownership has no idle timeout and cannot be stolen. Manual release is refused while a tool thread or owner background operation is still active, including work that outlived the MCP tool timeout. Forced shutdown signals cooperative cancellation, retains live thread and connection state after a join timeout, and keeps port `9881` until a later cleanup pass confirms that every owner resource stopped. These constraints keep handoff explicit and prevent two processes from using backend resources during a transition.
 
@@ -262,7 +281,7 @@ Defined in `instructions.py` and passed to `FastMCP(instructions=...)`. Automati
 ### Resources (3)
 - `ableton://session` — current session state
 - `ableton://tracks` — all track information
-- `ableton://capabilities` — server version, connections, cache
+- `ableton://capabilities` — server version, ownership-aware connections, cache
 
 ### Prompts (4)
 - `create_beat` — guided drum pattern creation
@@ -289,7 +308,8 @@ tests/
 ├── test_constants.py        # 4 tests: tier disjointness, completeness
 ├── test_state.py            # 5 tests: thread-safety, events, stores
 ├── test_tool_handler.py     # async decorator, errors, ownership guard, timeout safety
-└── test_ownership.py        # claims, release, metadata, collisions, two stdio clients
+├── test_ownership.py        # claims, release, metadata, collisions, two stdio clients
+└── test_status.py           # tri-state connections, public surfaces, dashboard status
 ```
 
 Run tests:
