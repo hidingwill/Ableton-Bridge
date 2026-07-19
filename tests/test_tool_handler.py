@@ -126,9 +126,10 @@ class TestToolHandler:
 
     @pytest.mark.asyncio
     async def test_ownership_claim_is_time_bounded(self, monkeypatch):
-        """A timed-out claim should retain serialization until claiming finishes."""
+        """A timed-out claim should finish safely without running the tool later."""
         started = threading.Event()
         finish = threading.Event()
+        executions = []
         semaphore = asyncio.Semaphore(1)
         monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
 
@@ -147,8 +148,9 @@ class TestToolHandler:
 
         @_tool_handler("claiming control")
         def guarded_tool():
-            """Fail if execution begins after ownership claiming times out."""
-            raise AssertionError("tool ran after a timed-out claim")
+            """Record any execution after the ownership claim returns."""
+            executions.append("ran")
+            return "unexpected"
 
         try:
             result = json.loads(await guarded_tool())
@@ -162,6 +164,56 @@ class TestToolHandler:
                     break
                 await asyncio.sleep(0.01)
         assert not semaphore.locked()
+        assert executions == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_ownership_claim_does_not_run_tool_later(self, monkeypatch):
+        """Cancellation during a claim must abandon work that has not started."""
+        started = threading.Event()
+        finish = threading.Event()
+        executions = []
+        semaphore = asyncio.Semaphore(1)
+        monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
+
+        def slow_claim(**_kwargs):
+            """Hold ownership startup until after the caller is cancelled."""
+            started.set()
+            finish.wait(timeout=1.0)
+            return ClaimResult(
+                acquired=True,
+                control={"control_role": "owner"},
+            )
+
+        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
+        monkeypatch.setattr(tool_base.ownership, "ensure_control", slow_claim)
+
+        @_tool_handler("claiming control")
+        def guarded_tool():
+            """Record any execution after the ownership claim returns."""
+            executions.append("ran")
+            return "unexpected"
+
+        call = asyncio.create_task(guarded_tool())
+        try:
+            for _ in range(50):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert semaphore.locked()
+        finally:
+            finish.set()
+            for _ in range(50):
+                if not semaphore.locked():
+                    break
+                await asyncio.sleep(0.01)
+
+        assert not semaphore.locked()
+        assert executions == []
 
     @pytest.mark.asyncio
     async def test_control_release_status_probe_runs_off_event_loop(self, monkeypatch):

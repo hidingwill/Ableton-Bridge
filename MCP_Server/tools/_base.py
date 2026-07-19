@@ -3,6 +3,7 @@ import asyncio
 import functools
 import json
 import logging
+import threading
 
 import MCP_Server.ownership as ownership
 
@@ -20,6 +21,25 @@ _TOOL_TIMEOUT_SECONDS = 120.0
 
 class _ControlReleasedError(RuntimeError):
     """Raised when queued backend work starts after ownership was released."""
+
+
+class _InvocationGate:
+    """Atomically decide whether client-abandoned work may begin."""
+
+    def __init__(self) -> None:
+        """Create a request that is initially allowed to start."""
+        self._lock = threading.Lock()
+        self._abandoned = False
+
+    def abandon(self) -> None:
+        """Prevent the tool body from starting after its caller has left."""
+        with self._lock:
+            self._abandoned = True
+
+    def try_start(self) -> bool:
+        """Return false when timeout or cancellation won the start race."""
+        with self._lock:
+            return not self._abandoned
 
 
 def _tool_handler(error_prefix: str, *, requires_control: bool = True):
@@ -44,6 +64,8 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             """Execute the wrapped tool through ownership and timeout guards."""
+            invocation = _InvocationGate()
+
             async def invoke():
                 """Claim control when required and run one guarded tool call."""
                 track_control = requires_control and ownership.is_configured()
@@ -64,6 +86,7 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                     args,
                     kwargs,
                     track_control,
+                    invocation,
                 )
 
             semaphore = None
@@ -89,6 +112,7 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
             except asyncio.TimeoutError:
                 # Worker threads cannot be cancelled. Keep the semaphore
                 # leased until the actual claim/tool work finishes.
+                invocation.abandon()
                 task.add_done_callback(_consume_background_result)
                 if semaphore is not None:
                     task.add_done_callback(
@@ -101,6 +125,7 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                 logger.error("Tool timed out after %ds: %s", _TOOL_TIMEOUT_SECONDS, error_prefix)
                 return tool_error(f"Tool timed out after {_TOOL_TIMEOUT_SECONDS}s: {error_prefix}")
             except asyncio.CancelledError:
+                invocation.abandon()
                 task.add_done_callback(_consume_background_result)
                 if semaphore is not None:
                     task.add_done_callback(
@@ -128,8 +153,16 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
     return decorator
 
 
-def _run_sync_tool(func, args: tuple, kwargs: dict, track_control: bool):
+def _run_sync_tool(
+    func,
+    args: tuple,
+    kwargs: dict,
+    track_control: bool,
+    invocation: _InvocationGate,
+):
     """Run a sync tool while tracking work that may outlive its async timeout."""
+    if not invocation.try_start():
+        return None
     if track_control and not ownership.begin_operation():
         raise _ControlReleasedError(
             "Ableton control was released before this operation began. Try again."
