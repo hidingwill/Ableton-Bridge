@@ -336,6 +336,7 @@ def get_ableton_connection():
         try:
             if not state.ableton_connection.is_connected():
                 raise ConnectionError("Socket is no longer connected")
+            state.ableton_connected_event.set()
             return state.ableton_connection
         except Exception as e:
             logger.warning("Existing connection is no longer valid: %s", e)

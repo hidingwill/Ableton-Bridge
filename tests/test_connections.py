@@ -189,16 +189,19 @@ class TestAbletonConnectionLiveness:
 
 
 class TestGetAbletonConnection:
-    def test_returns_existing_valid_connection(self):
-        """Should return existing connection if socket is valid."""
+    def test_returns_existing_valid_connection(self, monkeypatch):
+        """A reused valid connection should also signal backend readiness."""
         mock_conn = MagicMock()
         mock_conn.sock = MagicMock()
         mock_conn.is_connected.return_value = True
         mock_conn.send_command.return_value = {"status": "success"}
+        connected_event = threading.Event()
         state.ableton_connection = mock_conn
+        monkeypatch.setattr(state, "ableton_connected_event", connected_event)
         with patch('MCP_Server.connections.ableton.AbletonConnection'):
             result = get_ableton_connection()
             assert result == mock_conn
+            assert connected_event.is_set()
 
     def test_reconnects_on_dead_socket(self):
         """Should create new connection if existing socket is dead."""
