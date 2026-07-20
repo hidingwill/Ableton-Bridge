@@ -202,7 +202,7 @@ def _get_client_name(args: tuple, kwargs: dict) -> str | None:
         try:
             params = candidate.session.client_params
             name = params.clientInfo.name if params and params.clientInfo else None
-        except (AttributeError, ValueError):
+        except (AttributeError, RuntimeError, ValueError):
             continue
         if isinstance(name, str) and name:
             return name

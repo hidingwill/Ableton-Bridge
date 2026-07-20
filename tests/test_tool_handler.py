@@ -107,6 +107,49 @@ class TestToolHandler:
         assert result["message"] == "standby"
 
     @pytest.mark.asyncio
+    async def test_unbound_client_context_does_not_fail_tool(self, monkeypatch):
+        """Unavailable best-effort client metadata must not block control tools."""
+        claims = []
+        ended = []
+        semaphore = asyncio.Semaphore(1)
+
+        class UnboundContext:
+            """Model a FastMCP Context outside an active request scope."""
+
+            @property
+            def session(self):
+                """Raise the error FastMCP uses for unavailable session state."""
+                raise RuntimeError("request context is unavailable")
+
+        monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
+        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "ensure_control",
+            lambda **kwargs: (
+                claims.append(kwargs)
+                or ClaimResult(True, {"control_role": "owner"})
+            ),
+        )
+        monkeypatch.setattr(tool_base.ownership, "begin_operation", lambda: True)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "end_operation",
+            lambda: ended.append(True),
+        )
+
+        @_tool_handler("using optional client metadata")
+        def guarded_tool(_ctx):
+            """Return normally when client metadata is unavailable."""
+            return "success"
+
+        result = json.loads(await guarded_tool(UnboundContext()))
+
+        assert result["status"] == "ok"
+        assert claims == [{"client_name": None}]
+        assert ended == [True]
+
+    @pytest.mark.asyncio
     async def test_control_exempt_tool_bypasses_ableton_semaphore(self, monkeypatch):
         """Status and release tools should remain callable during owner work."""
         semaphore = asyncio.Semaphore(1)
