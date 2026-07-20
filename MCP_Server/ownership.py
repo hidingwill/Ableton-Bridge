@@ -35,6 +35,7 @@ class ClaimResult:
     acquired: bool
     control: dict
     error: Optional[str] = None
+    claim_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class OwnershipManager:
         self._responder_stop: Optional[threading.Event] = None
         self._responder_thread: Optional[threading.Thread] = None
         self._owner: Optional[dict] = None
+        self._claim_token: Optional[str] = None
         self._phase = "standby"
         self._active_operations = 0
         self._start_backend: Optional[Callable[[], None]] = None
@@ -161,6 +163,8 @@ class OwnershipManager:
 
             self._listener = listener
             self._owner = owner
+            claim_token = str(uuid.uuid4())
+            self._claim_token = claim_token
             self._phase = "starting"
             self._responder_stop = responder_stop
             self._responder_thread = responder_thread
@@ -193,7 +197,23 @@ class OwnershipManager:
                 self.port,
                 os.getpid(),
             )
-            return ClaimResult(True, self._local_status_locked())
+            return ClaimResult(
+                True,
+                self._local_status_locked(),
+                claim_token=claim_token,
+            )
+
+    def release_if_current_claim(self, claim_token: str) -> ReleaseResult:
+        """Release only the ownership generation created by one claim call."""
+        with self._transition_lock:
+            with self._lock:
+                is_current = (
+                    self._listener is not None
+                    and self._claim_token == claim_token
+                )
+            if not is_current:
+                return ReleaseResult(False, self.status())
+            return self._release()
 
     def release(self, *, force: bool = False) -> ReleaseResult:
         """Release local ownership; never release another process's ownership."""
@@ -494,6 +514,7 @@ class OwnershipManager:
             self._responder_stop = None
             self._responder_thread = None
             self._owner = None
+            self._claim_token = None
             self._phase = "standby"
             self._active_operations = 0
 
@@ -527,6 +548,11 @@ def ensure_control(*, client_name: Optional[str] = None) -> ClaimResult:
 def release_control(*, force: bool = False) -> ReleaseResult:
     """Release only the Ableton control owned by this MCP process."""
     return _manager.release(force=force)
+
+
+def release_if_current_claim(claim_token: str) -> ReleaseResult:
+    """Release an abandoned claim only if its ownership is still current."""
+    return _manager.release_if_current_claim(claim_token)
 
 
 def shutdown() -> None:

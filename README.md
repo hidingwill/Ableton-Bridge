@@ -114,7 +114,7 @@ AbletonBridge is built to handle real-world sessions without crashing Ableton:
 - **Tiered command delays** — 3-tier system (0ms/10ms/20ms) eliminates unnecessary waits for property setters
 - **Async tool handlers** — all tools run via `asyncio.to_thread()`, preventing sync I/O from blocking the event loop
 - **Concurrency control** — async semaphore serializes tool dispatch; threading locks protect TCP and UDP sockets from corruption
-- **Tool execution timeout** — 120s hard timeout prevents stuck tools from blocking the entire pipeline
+- **Tool response deadline** — callers receive a structured timeout after 120s, including queue time; already-running work stays serialized until it exits because worker threads cannot be cancelled safely
 - **Bounded thread pool** — explicit 8-worker limit prevents resource exhaustion during rapid tool call bursts
 - **Standardized responses** — all 347 tools return consistent `tool_success()`/`tool_error()` JSON envelopes via decorator
 - **Chunk reassembly hardening** — duplicate detection, progress logging, missing chunk index reporting

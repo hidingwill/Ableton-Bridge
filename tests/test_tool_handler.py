@@ -168,25 +168,34 @@ class TestToolHandler:
             semaphore.release()
 
     @pytest.mark.asyncio
-    async def test_ownership_claim_is_time_bounded(self, monkeypatch):
-        """A timed-out claim should finish safely without running the tool later."""
+    async def test_ownership_claim_is_time_bounded(
+        self,
+        monkeypatch,
+        unused_tcp_port,
+    ):
+        """A timed-out new claim should roll back without running the tool."""
         started = threading.Event()
         finish = threading.Event()
         executions = []
         semaphore = asyncio.Semaphore(1)
+        manager = OwnershipManager(unused_tcp_port)
         monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
 
-        def slow_claim(**_kwargs):
-            """Hold ownership startup beyond the client-facing timeout."""
+        def slow_start():
+            """Hold a real ownership startup beyond the response deadline."""
             started.set()
             finish.wait(timeout=1.0)
-            return ClaimResult(
-                acquired=True,
-                control={"control_role": "owner"},
-            )
 
-        monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
-        monkeypatch.setattr(tool_base.ownership, "ensure_control", slow_claim)
+        manager.configure_backend(slow_start, lambda: None)
+        monkeypatch.setattr(tool_base.ownership, "is_configured", manager.is_configured)
+        monkeypatch.setattr(tool_base.ownership, "ensure_control", manager.ensure_control)
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "release_if_current_claim",
+            manager.release_if_current_claim,
+        )
+        monkeypatch.setattr(tool_base.ownership, "begin_operation", manager.begin_operation)
+        monkeypatch.setattr(tool_base.ownership, "end_operation", manager.end_operation)
         monkeypatch.setattr(tool_base, "_TOOL_TIMEOUT_SECONDS", 0.02)
 
         @_tool_handler("claiming control")
@@ -200,14 +209,48 @@ class TestToolHandler:
             assert started.is_set()
             assert "timed out" in result["message"]
             assert semaphore.locked()
-        finally:
+
             finish.set()
             for _ in range(50):
-                if not semaphore.locked():
+                if (
+                    not semaphore.locked()
+                    and manager.status()["control_role"] == "standby"
+                ):
                     break
                 await asyncio.sleep(0.01)
-        assert not semaphore.locked()
-        assert executions == []
+
+            assert not semaphore.locked()
+            assert executions == []
+            assert manager.status()["control_role"] == "standby"
+        finally:
+            finish.set()
+            manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_waiting_for_control_semaphore_uses_response_deadline(
+        self,
+        monkeypatch,
+    ):
+        """A queued control call should time out without starting background work."""
+        executions = []
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        monkeypatch.setattr(tool_base, "_ableton_semaphore", semaphore)
+        monkeypatch.setattr(tool_base, "_TOOL_TIMEOUT_SECONDS", 0.02)
+
+        @_tool_handler("waiting for control")
+        def guarded_tool():
+            """Record any execution after the queueing deadline expires."""
+            executions.append("ran")
+            return "unexpected"
+
+        try:
+            result = json.loads(await guarded_tool())
+            assert "timed out" in result["message"]
+            assert executions == []
+            assert semaphore.locked()
+        finally:
+            semaphore.release()
 
     @pytest.mark.asyncio
     async def test_cancelled_ownership_claim_does_not_run_tool_later(self, monkeypatch):
@@ -229,6 +272,16 @@ class TestToolHandler:
 
         monkeypatch.setattr(tool_base.ownership, "is_configured", lambda: True)
         monkeypatch.setattr(tool_base.ownership, "ensure_control", slow_claim)
+
+        def unexpected_release(_claim_token):
+            """Never release ownership that predated the abandoned invocation."""
+            raise AssertionError("pre-existing ownership was released")
+
+        monkeypatch.setattr(
+            tool_base.ownership,
+            "release_if_current_claim",
+            unexpected_release,
+        )
 
         @_tool_handler("claiming control")
         def guarded_tool():
@@ -432,15 +485,21 @@ class TestToolHandler:
             follower = asyncio.create_task(follower_tool())
             await asyncio.sleep(0.03)
             assert not follower_started.is_set()
+            follower_result = json.loads(await follower)
+            assert "timed out" in follower_result["message"]
 
             finish.set()
             for _ in range(50):
-                if manager.status()["active_operations"] == 0:
+                if (
+                    manager.status()["active_operations"] == 0
+                    and not semaphore.locked()
+                ):
                     break
                 await asyncio.sleep(0.01)
 
             assert manager.status()["active_operations"] == 0
-            assert json.loads(await follower)["message"] == "followed"
+            assert json.loads(await follower_tool())["message"] == "followed"
+            assert follower_started.is_set()
             assert manager.release().released is True
         finally:
             finish.set()

@@ -14,9 +14,12 @@ logger = logging.getLogger("AbletonBridge")
 # This prevents thread pool exhaustion and ensures orderly command dispatch.
 _ableton_semaphore = asyncio.Semaphore(1)
 
-# Absolute timeout for any single tool call (prevents a stuck tool from
-# blocking the semaphore indefinitely).
+# Client response deadline, including time queued behind another control tool.
+# An already-running worker keeps the semaphore until it actually exits because
+# Python worker threads cannot be cancelled safely.
 _TOOL_TIMEOUT_SECONDS = 120.0
+
+_INVOCATION_ABANDONED = object()
 
 
 class _ControlReleasedError(RuntimeError):
@@ -48,9 +51,10 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
     Runs the synchronous tool function in a thread pool via asyncio.to_thread()
     so it doesn't block the FastMCP async event loop during TCP/UDP I/O.
 
-    An asyncio.Semaphore gates entry so that only one tool occupies the thread
-    pool (and the shared TCP socket) at a time. An outer timeout ensures a
-    stuck tool releases the semaphore after _TOOL_TIMEOUT_SECONDS.
+    An asyncio.Semaphore gates entry so that only one tool occupies the shared
+    backend at a time. A response deadline bounds both queueing and execution
+    from the caller's perspective. If a worker has already started, its lease
+    remains held until it exits so later tools cannot overlap its socket work.
 
     All plain-string returns are wrapped in tool_success() for consistent JSON
     envelope. Returns that are already JSON (start with '{' or '[') pass through.
@@ -69,6 +73,7 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
             async def invoke():
                 """Claim control when required and run one guarded tool call."""
                 track_control = requires_control and ownership.is_configured()
+                claim_token = None
                 if track_control:
                     claim = await asyncio.to_thread(
                         ownership.ensure_control,
@@ -79,8 +84,9 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                             claim.error or "Ableton control is unavailable.",
                             {"control": claim.control},
                         )
+                    claim_token = claim.claim_token
 
-                return await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     _run_sync_tool,
                     func,
                     args,
@@ -88,20 +94,53 @@ def _tool_handler(error_prefix: str, *, requires_control: bool = True):
                     track_control,
                     invocation,
                 )
+                if result is _INVOCATION_ABANDONED:
+                    if claim_token is not None:
+                        release = await asyncio.to_thread(
+                            ownership.release_if_current_claim,
+                            claim_token,
+                        )
+                        if not release.released and release.error:
+                            logger.warning(
+                                "Could not roll back abandoned Ableton claim: %s",
+                                release.error,
+                            )
+                    return None
+                return result
 
+            deadline = asyncio.get_running_loop().time() + _TOOL_TIMEOUT_SECONDS
             semaphore = None
             if requires_control:
-                # Acquiring remains caller-cancellable. Once acquired, the
-                # lease follows the real shielded work rather than the caller.
+                # Queueing is part of the caller's response deadline. Once the
+                # lease is acquired, it follows real work rather than the caller.
                 semaphore = _ableton_semaphore
-                await semaphore.acquire()
+                try:
+                    await asyncio.wait_for(
+                        semaphore.acquire(),
+                        timeout=max(
+                            0.0,
+                            deadline - asyncio.get_running_loop().time(),
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Tool timed out after %ds waiting for serialized control: %s",
+                        _TOOL_TIMEOUT_SECONDS,
+                        error_prefix,
+                    )
+                    return tool_error(
+                        f"Tool timed out after {_TOOL_TIMEOUT_SECONDS}s: {error_prefix}"
+                    )
 
             task = asyncio.create_task(invoke())
             release_deferred = False
             try:
                 result = await asyncio.wait_for(
                     asyncio.shield(task),
-                    timeout=_TOOL_TIMEOUT_SECONDS,
+                    timeout=max(
+                        0.0,
+                        deadline - asyncio.get_running_loop().time(),
+                    ),
                 )
                 if isinstance(result, str):
                     stripped = result.strip()
@@ -167,7 +206,7 @@ def _run_sync_tool(
         )
     try:
         if not invocation.try_start():
-            return None
+            return _INVOCATION_ABANDONED
         return func(*args, **kwargs)
     finally:
         if track_control:

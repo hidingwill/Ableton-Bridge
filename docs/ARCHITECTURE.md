@@ -298,8 +298,8 @@ All tools use the `@_tool_handler` decorator which:
 1. Gates owner-dependent execution via `asyncio.Semaphore(1)` to prevent TCP socket corruption; claim-free status and release remain available as recovery paths
 2. Automatically claims Ableton control for normal tools with a bounded wait; status and release are explicitly exempt
 3. Wraps sync functions in `asyncio.to_thread()` for non-blocking execution
-4. Abandons calls that time out before their tool body starts, while tracking already-running workers until they exit
-5. Enforces a 120-second timeout via `asyncio.wait_for()`
+4. Abandons calls that time out before their tool body starts, rolling back ownership only when that invocation created the still-current claim
+5. Enforces a 120-second caller response deadline across queueing and execution; already-running workers keep their serialization lease until they exit
 6. Returns consistent structured success, validation, connection, ownership, timeout, and generic error responses
 
 ## Testing

@@ -70,6 +70,29 @@ def test_release_allows_standby_to_claim(unused_tcp_port):
         second.shutdown()
 
 
+def test_abandoned_claim_release_is_generation_safe(unused_tcp_port):
+    """A stale claim token must not release a newer local ownership generation."""
+    manager = _configured_manager(unused_tcp_port)
+    try:
+        first = manager.ensure_control()
+        assert first.claim_token is not None
+        assert manager.release().released is True
+
+        second = manager.ensure_control()
+        assert second.claim_token is not None
+        assert second.claim_token != first.claim_token
+
+        stale = manager.release_if_current_claim(first.claim_token)
+        assert stale.released is False
+        assert manager.status()["control_role"] == "owner"
+
+        current = manager.release_if_current_claim(second.claim_token)
+        assert current.released is True
+        assert manager.status()["control_role"] == "standby"
+    finally:
+        manager.shutdown()
+
+
 def test_shutdown_automatically_releases_control(unused_tcp_port):
     """Normal process shutdown should release control for another manager."""
     owner = _configured_manager(unused_tcp_port)
