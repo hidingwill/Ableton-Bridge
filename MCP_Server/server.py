@@ -14,15 +14,11 @@ All mutable runtime state lives in MCP_Server/state.py
 import asyncio
 import concurrent.futures
 import logging
-import os
-import socket
-import sys
 import time
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict
 from datetime import datetime, timezone
-from collections import deque
 
 # ---------------------------------------------------------------------------
 # MCP framework
@@ -33,7 +29,9 @@ from mcp.server.fastmcp import FastMCP
 # Internal modules
 # ---------------------------------------------------------------------------
 import MCP_Server.state as state
-from MCP_Server.connections.ableton import AbletonConnection, get_ableton_connection
+import MCP_Server.ownership as ownership
+from MCP_Server.status import build_connection_status
+from MCP_Server.connections.ableton import get_ableton_connection
 from MCP_Server.connections.m4l import M4LConnection
 from MCP_Server.cache.browser import load_browser_cache_from_disk, populate_browser_cache
 from MCP_Server.dashboard.server import (
@@ -55,87 +53,81 @@ logger = logging.getLogger("AbletonBridge")
 
 
 # ===================================================================
-# Singleton lock — prevent duplicate server instances
-# ===================================================================
-
-def _acquire_singleton_lock() -> socket.socket:
-    """Acquire an exclusive TCP port lock to prevent duplicate server instances.
-
-    Returns the bound socket (caller must keep it alive for the server's
-    lifetime).  Raises RuntimeError if another instance already holds the lock.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        sock.bind(("127.0.0.1", state.SINGLETON_LOCK_PORT))
-        sock.listen(1)
-        logger.info("Singleton lock acquired on port %d", state.SINGLETON_LOCK_PORT)
-        return sock
-    except OSError as e:
-        sock.close()
-        raise RuntimeError(
-            f"Another AbletonBridge server instance is already running "
-            f"(port {state.SINGLETON_LOCK_PORT} is in use). "
-            f"Stop the other instance first."
-        ) from e
-
-
-def _release_singleton_lock(sock: socket.socket):
-    """Release the singleton lock by closing the lock socket."""
-    if sock:
-        try:
-            sock.close()
-            logger.info("Singleton lock released")
-        except Exception:
-            pass
-
-
-# ===================================================================
 # M4L auto-connect (background thread)
 # ===================================================================
 
-def _m4l_auto_connect():
+def _m4l_auto_connect(stop_event: threading.Event):
     """Background thread: create UDP sockets once, retry ping until M4L responds."""
-    # Create sockets once — don't tear them down between retries
-    conn = M4LConnection()
-    if not conn.connect():
-        logger.warning("M4L auto-connect: could not bind UDP sockets")
+    if stop_event.is_set():
         return
 
-    state.m4l_connection = conn
+    # Publish one connection-and-cache generation atomically. Normal tools use
+    # the same lock when verifying or replacing this connection.
+    with state.m4l_connection_lock:
+        if stop_event.is_set():
+            return
+        if state.m4l_connection is not None:
+            conn = state.m4l_connection
+            if not conn._connected:
+                return
+        else:
+            state.m4l_status_snapshot = (False, False)
+            state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
+            conn = M4LConnection()
+            if not conn.connect():
+                logger.warning("M4L auto-connect: could not bind UDP sockets")
+                return
+            if stop_event.is_set():
+                conn.disconnect()
+                return
+            state.m4l_connection = conn
+            state.m4l_status_snapshot = (True, False)
 
     # Build a raw OSC ping packet
     ping_id = "autocon"
     ping_osc = M4LConnection._build_osc_message("/ping", [("s", ping_id)])
 
     for attempt in range(1, 16):  # 15 attempts, ~2 s apart
+        if stop_event.is_set():
+            return
         try:
-            # Drain stale data
-            conn._drain_recv_socket()
-            conn.recv_sock.settimeout(2.0)
+            with state.m4l_connection_lock:
+                if stop_event.is_set() or state.m4l_connection is not conn:
+                    return
+                with conn._send_lock:
+                    # Drain stale data
+                    conn._drain_recv_socket()
+                    conn.recv_sock.settimeout(2.0)
 
-            # Send ping
-            conn.send_sock.sendto(ping_osc, (conn.send_host, conn.send_port))
+                    # Send ping
+                    conn.send_sock.sendto(ping_osc, (conn.send_host, conn.send_port))
 
-            # Wait for response
-            data, _addr = conn.recv_sock.recvfrom(65535)
-            result = conn._parse_m4l_response(data)
-            if result.get("status") == "success":
-                logger.info("M4L bridge auto-connected on attempt %d", attempt)
-                state.m4l_ping_cache["result"] = True
-                state.m4l_ping_cache["timestamp"] = time.time()
-                # Check bridge version compatibility
-                M4LConnection._check_bridge_version(result)
+                    # Wait for response
+                    data, _addr = conn.recv_sock.recvfrom(65535)
+                    result = conn._parse_m4l_response(data)
+                if result.get("status") == "success":
+                    logger.info("M4L bridge auto-connected on attempt %d", attempt)
+                    state.m4l_ping_cache = {
+                        "result": True,
+                        "timestamp": time.time(),
+                    }
+                    state.m4l_status_snapshot = (True, True)
+                    # Check bridge version compatibility
+                    M4LConnection._check_bridge_version(result)
+                    return
+        except TimeoutError:
+            if stop_event.is_set():
                 return
-        except socket.timeout:
             logger.info(
                 "M4L auto-connect %d/15: no response (timeout), retrying...",
                 attempt,
             )
         except Exception as e:
+            if stop_event.is_set():
+                return
             logger.info("M4L auto-connect %d/15: %s", attempt, e)
-        time.sleep(2)
+        if stop_event.wait(2.0):
+            return
 
     logger.warning(
         "M4L bridge not available after 15 attempts — will retry when needed"
@@ -146,7 +138,7 @@ def _m4l_auto_connect():
 # Browser cache warmup (background thread)
 # ===================================================================
 
-def _browser_cache_warmup():
+def _browser_cache_warmup(stop_event: threading.Event):
     """Background thread: load disk cache instantly, then refresh from Ableton."""
     from MCP_Server.constants import BROWSER_DISK_CACHE_MAX_AGE
 
@@ -164,35 +156,147 @@ def _browser_cache_warmup():
         )
 
     # Step 2: Wait for Ableton connection, then do a live scan to refresh
-    state.ableton_connected_event.wait(timeout=30.0)
+    deadline = time.monotonic() + 30.0
+    while not state.ableton_connected_event.is_set():
+        if stop_event.wait(0.1) or time.monotonic() >= deadline:
+            return
     if not (state.ableton_connection and state.ableton_connection.sock):
         logger.warning(
             "Browser cache warmup: Ableton not connected after 30s, skipping live scan"
         )
         return
-    time.sleep(0.5)  # brief settle after connection confirmed
+    if stop_event.wait(0.5):  # brief settle after connection confirmed
+        return
     try:
-        populate_browser_cache()
+        populate_browser_cache(stop_event=stop_event)
     except Exception as e:
         logger.warning("Browser cache warmup failed: %s", e)
 
 
 # ===================================================================
-# Server lifespan — startup / shutdown
+# Control-owner backend lifecycle
+# ===================================================================
+
+def _start_control_backend():
+    """Start resources that must exist in exactly one MCP process."""
+    logger.info("Starting Ableton control backend")
+    stop_event = threading.Event()
+    state.control_stop_event = stop_event
+    state.control_background_threads = []
+    state.ableton_connected_event.clear()
+
+    # Live connectivity is required for a successful ownership claim.
+    get_ableton_connection()
+
+    try:
+        start_dashboard_server()
+    except Exception as e:
+        logger.warning("Dashboard failed to start: %s", e)
+
+    for target, name in (
+        (_m4l_auto_connect, "m4l-auto-connect"),
+        (_browser_cache_warmup, "browser-cache-warmup"),
+    ):
+        thread = threading.Thread(
+            target=target,
+            args=(stop_event,),
+            daemon=True,
+            name=name,
+        )
+        state.control_background_threads.append(thread)
+        try:
+            thread.start()
+        except Exception:
+            state.control_background_threads = [
+                worker
+                for worker in state.control_background_threads
+                if worker is not thread
+            ]
+            raise
+
+
+def _stop_control_backend() -> bool:
+    """Stop owner-only resources and report when handoff is safe."""
+    cleanup_complete = True
+    stop_event = state.control_stop_event
+    if stop_event is not None:
+        stop_event.set()
+
+    try:
+        dashboard_stopped = stop_dashboard_server()
+    except Exception as exc:
+        dashboard_stopped = False
+        logger.warning("Dashboard shutdown failed during release: %s", exc)
+    if dashboard_stopped is False:
+        cleanup_complete = False
+
+    ableton_connection = state.ableton_connection
+    if ableton_connection:
+        logger.info("Disconnecting from Ableton")
+        try:
+            ableton_connection.disconnect()
+        except Exception as exc:
+            cleanup_complete = False
+            logger.warning("Ableton disconnect failed during release: %s", exc)
+        else:
+            if state.ableton_connection is ableton_connection:
+                state.ableton_connection = None
+
+    remaining_threads = []
+    for thread in list(state.control_background_threads):
+        stopped = False
+        if thread is not threading.current_thread() and thread.ident is not None:
+            try:
+                thread.join(timeout=3.0)
+            except RuntimeError as exc:
+                logger.warning(
+                    "Could not join control background thread %s: %s",
+                    thread.name,
+                    exc,
+                )
+            else:
+                stopped = not thread.is_alive()
+        if not stopped:
+            cleanup_complete = False
+            remaining_threads.append(thread)
+            logger.warning(
+                "Control background thread %s is still stopping",
+                thread.name,
+            )
+
+    state.control_background_threads = remaining_threads
+
+    # M4L is published by its warmup worker, so re-read it only after joining
+    # workers. This catches a connection created just as cancellation began.
+    with state.m4l_connection_lock:
+        state.m4l_status_snapshot = (False, False)
+        m4l_connection = state.m4l_connection
+        if m4l_connection:
+            logger.info("Disconnecting M4L bridge")
+            try:
+                m4l_connection.disconnect()
+            except Exception as exc:
+                cleanup_complete = False
+                logger.warning("M4L disconnect failed during release: %s", exc)
+            else:
+                if state.m4l_connection is m4l_connection:
+                    state.m4l_connection = None
+        state.m4l_ping_cache = {"result": False, "timestamp": 0.0}
+
+    if cleanup_complete:
+        state.control_stop_event = None
+    state.ableton_connected_event.clear()
+    return cleanup_complete
+
+
+# ===================================================================
+# Server lifespan — MCP availability is independent of backend ownership
 # ===================================================================
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle."""
     try:
-        # Singleton guard
-        try:
-            state.singleton_lock_sock = _acquire_singleton_lock()
-        except RuntimeError as e:
-            logger.error(str(e))
-            logger.error("Exiting to avoid conflicts.")
-            sys.exit(1)
-
         logger.info("AbletonBridge server starting up")
         state.server_start_time = time.time()
 
@@ -205,29 +309,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             concurrent.futures.ThreadPoolExecutor(max_workers=8)
         )
 
-        # Connect to Ableton (Remote Script TCP)
-        try:
-            ableton = get_ableton_connection()
-            logger.info("Successfully connected to Ableton on startup")
-        except Exception as e:
-            logger.warning("Could not connect to Ableton on startup: %s", e)
-            logger.warning("Make sure the Ableton Remote Script is running")
-
-        # Auto-connect M4L bridge in background
-        threading.Thread(
-            target=_m4l_auto_connect, daemon=True, name="m4l-auto-connect"
-        ).start()
-
-        # Start web dashboard on background thread
-        try:
-            start_dashboard_server()
-        except Exception as e:
-            logger.warning("Dashboard failed to start: %s", e)
-
-        # Pre-populate browser cache in background
-        threading.Thread(
-            target=_browser_cache_warmup, daemon=True, name="browser-cache-warmup"
-        ).start()
+        ownership.configure_backend(_start_control_backend, _stop_control_backend)
 
         # Load saved effect chain templates from disk
         try:
@@ -239,21 +321,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         yield {}
 
     finally:
-        # Shutdown sequence
-        stop_dashboard_server()
-
-        if state.ableton_connection:
-            logger.info("Disconnecting from Ableton on shutdown")
-            state.ableton_connection.disconnect()
-            state.ableton_connection = None
-
-        if state.m4l_connection:
-            logger.info("Disconnecting M4L bridge on shutdown")
-            state.m4l_connection.disconnect()
-            state.m4l_connection = None
-
-        _release_singleton_lock(state.singleton_lock_sock)
-        state.singleton_lock_sock = None
+        ownership.shutdown()
+        ownership.unconfigure_backend()
         logger.info("AbletonBridge server shut down")
 
 
@@ -289,36 +358,51 @@ register_prompts(mcp)
 @mcp.resource("ableton://session")
 def resource_session() -> str:
     """Current Ableton session info (tempo, tracks, transport state)."""
-    import json
-    try:
-        ableton = get_ableton_connection()
-        result = ableton.send_command("get_session_info")
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    return _run_controlled_resource("get_session_info")
 
 
 @mcp.resource("ableton://tracks")
 def resource_tracks() -> str:
     """All track information including devices, clips, and routing."""
+    return _run_controlled_resource("get_all_tracks_info")
+
+
+def _run_controlled_resource(command: str) -> str:
+    """Run an Ableton resource read under the same ownership contract as tools."""
     import json
+
+    claim = ownership.ensure_control()
+    if not claim.acquired:
+        return json.dumps({
+            "status": "error",
+            "message": claim.error,
+            "data": {"control": claim.control},
+        })
+    if not ownership.begin_operation():
+        return json.dumps({
+            "status": "error",
+            "message": "Ableton control was released before the resource read began.",
+            "data": {"control": ownership.get_status()},
+        })
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_all_tracks_info")
-        return json.dumps(result)
+        return json.dumps(ableton.send_command(command))
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"status": "error", "message": str(e)})
+    finally:
+        ownership.end_operation()
 
 
 @mcp.resource("ableton://capabilities")
 def resource_capabilities() -> str:
-    """Server capabilities, connection status, and version info."""
+    """Return version, ownership, and role-aware connection status."""
     import json
     from MCP_Server import __version__
+    control = ownership.get_status()
     result = {
         "server_version": __version__,
-        "ableton_connected": bool(state.ableton_connection and state.ableton_connection.sock),
-        "m4l_connected": bool(state.m4l_connection and state.m4l_connection._connected),
+        **control,
+        **build_connection_status(control),
         "m4l_bridge_version": state.m4l_bridge_version or "unknown",
         "browser_cache_ready": state.browser_cache_ready.is_set(),
         "browser_cache_items": len(state.browser_cache_flat),

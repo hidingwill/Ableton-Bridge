@@ -2,8 +2,14 @@ import pytest
 import json
 import socket
 import time
+import threading
 from unittest.mock import MagicMock, patch, PropertyMock, call
-from MCP_Server.connections.ableton import AbletonConnection, get_ableton_connection, NON_IDEMPOTENT_COMMANDS
+from MCP_Server.connections.ableton import (
+    AbletonConnection,
+    CommandCancelled,
+    NON_IDEMPOTENT_COMMANDS,
+    get_ableton_connection,
+)
 from MCP_Server.constants import TIER_0_COMMANDS, TIER_1_COMMANDS, TIER_2_COMMANDS
 import MCP_Server.state as state
 
@@ -38,6 +44,7 @@ class TestAbletonConnectionSendCommand:
         conn._recv_buffer = ""
         call_count = [0]
         def side_effect(*args, **kwargs):
+            """Fail the first receive and succeed after reconnection."""
             call_count[0] += 1
             if call_count[0] == 1:
                 raise socket.error("connection reset")
@@ -75,24 +82,132 @@ class TestAbletonConnectionSendCommand:
         assert len(TIER_1_COMMANDS & TIER_2_COMMANDS) == 0
         assert len(TIER_0_COMMANDS & TIER_2_COMMANDS) == 0
 
+    def test_receive_full_response_honors_shutdown(self):
+        """Socket receive cancellation should be prompt and suppress timeout context."""
+        conn = AbletonConnection(host="localhost", port=9877)
+        client, server = socket.socketpair()
+        stop_event = threading.Event()
+        timer = threading.Timer(0.05, stop_event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(CommandCancelled) as exc_info:
+                conn.receive_full_response(
+                    client,
+                    timeout=5.0,
+                    stop_event=stop_event,
+                )
+            assert time.monotonic() - started < 1.0
+            assert exc_info.value.__suppress_context__ is True
+        finally:
+            timer.cancel()
+            client.close()
+            server.close()
+
+    def test_retry_delay_cancellation_suppresses_failure_context(self):
+        """Retry cancellation should not present the triggering command error as its cause."""
+        conn = AbletonConnection(host="localhost", port=9877)
+        conn.sock = MagicMock()
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.return_value = True
+
+        with patch.object(
+            conn,
+            "receive_full_response",
+            side_effect=RuntimeError("command failed"),
+        ):
+            with pytest.raises(CommandCancelled) as exc_info:
+                conn.send_command("get_session_info", stop_event=stop_event)
+
+        assert exc_info.value.__suppress_context__ is True
+
+
+class TestAbletonConnectionLiveness:
+    def test_open_peer_is_connected(self):
+        """An open idle peer should remain connected without receiving data."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            assert connection.is_connected() is True
+        finally:
+            client.close()
+            server.close()
+
+    def test_closed_peer_is_disconnected(self):
+        """A clean peer shutdown should be visible without sending a command."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.shutdown(socket.SHUT_RDWR)
+            server.close()
+            assert connection.is_connected() is False
+        finally:
+            client.close()
+
+    def test_liveness_check_does_not_consume_pending_data(self):
+        """Peeking at a readable socket must leave protocol bytes untouched."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.sendall(b"response")
+            assert connection.is_connected() is True
+            assert client.recv(8) == b"response"
+        finally:
+            client.close()
+            server.close()
+
+    def test_busy_connection_is_not_disturbed(self):
+        """Status should reuse the last healthy result while a command is active."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        connection._send_lock.acquire()
+        try:
+            assert connection.is_connected() is True
+            assert connection._send_lock.locked()
+        finally:
+            connection._send_lock.release()
+            client.close()
+            server.close()
+
+    def test_busy_connection_preserves_last_disconnected_result(self):
+        """A busy status check should not turn a known dead socket back to true."""
+        client, server = socket.socketpair()
+        connection = AbletonConnection("localhost", 9877, sock=client)
+        try:
+            server.shutdown(socket.SHUT_RDWR)
+            server.close()
+            assert connection.is_connected() is False
+
+            connection._send_lock.acquire()
+            assert connection.is_connected() is False
+            assert connection._send_lock.locked()
+        finally:
+            if connection._send_lock.locked():
+                connection._send_lock.release()
+            client.close()
+
 
 class TestGetAbletonConnection:
-    def test_returns_existing_valid_connection(self):
-        """Should return existing connection if socket is valid."""
+    def test_returns_existing_valid_connection(self, monkeypatch):
+        """A reused valid connection should also signal backend readiness."""
         mock_conn = MagicMock()
         mock_conn.sock = MagicMock()
-        mock_conn.sock.getpeername.return_value = ("localhost", 9877)
+        mock_conn.is_connected.return_value = True
         mock_conn.send_command.return_value = {"status": "success"}
+        connected_event = threading.Event()
         state.ableton_connection = mock_conn
+        monkeypatch.setattr(state, "ableton_connected_event", connected_event)
         with patch('MCP_Server.connections.ableton.AbletonConnection'):
             result = get_ableton_connection()
             assert result == mock_conn
+            assert connected_event.is_set()
 
     def test_reconnects_on_dead_socket(self):
         """Should create new connection if existing socket is dead."""
         mock_conn = MagicMock()
         mock_conn.sock = MagicMock()
-        mock_conn.sock.getpeername.side_effect = socket.error("not connected")
+        mock_conn.is_connected.return_value = False
         state.ableton_connection = mock_conn
         new_conn = MagicMock()
         new_conn.connect.return_value = True

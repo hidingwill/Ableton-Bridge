@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import MCP_Server.state as state
+import MCP_Server.ownership as ownership
 from MCP_Server.dashboard.html import DASHBOARD_HTML
+from MCP_Server.status import build_connection_status
 
 logger = logging.getLogger("AbletonBridge")
 
@@ -31,6 +33,7 @@ class DashboardLogHandler(logging.Handler):
     """
 
     def emit(self, record):
+        """Append one safely formatted log record to the dashboard buffer."""
         try:
             with state.server_log_lock:
                 state.server_log_buffer.append(
@@ -72,38 +75,9 @@ def get_server_version() -> str:
         return __version__
 
 
-def get_m4l_status() -> tuple:
-    """Return (sockets_ready, bridge_responding) with cached ping."""
-    sockets_ready = bool(state.m4l_connection and state.m4l_connection._connected)
-    if not sockets_ready:
-        return False, False
-
-    now = time.time()
-    if now - state.m4l_ping_cache["timestamp"] < state.M4L_PING_CACHE_TTL:
-        return sockets_ready, state.m4l_ping_cache["result"]
-
-    try:
-        result = state.m4l_connection.ping()
-    except Exception as e:
-        logger.debug("Dashboard M4L ping failed: %s", e)
-        result = False
-
-    state.m4l_ping_cache["result"] = result
-    state.m4l_ping_cache["timestamp"] = now
-    return sockets_ready, result
-
-
 def build_status_json() -> dict:
     """Collect all dashboard status data into a JSON-serializable dict."""
-    ableton_connected = False
-    if state.ableton_connection and state.ableton_connection.sock:
-        try:
-            state.ableton_connection.sock.getpeername()
-            ableton_connected = True
-        except Exception:
-            pass
-
-    m4l_sockets_ready, m4l_connected = get_m4l_status()
+    connections = build_connection_status(ownership.get_status())
 
     with state.tool_call_lock:
         recent = list(state.tool_call_log)
@@ -124,9 +98,7 @@ def build_status_json() -> dict:
     return {
         "version": get_server_version(),
         "uptime_seconds": round(time.time() - state.server_start_time, 1) if state.server_start_time else 0,
-        "ableton_connected": ableton_connected,
-        "m4l_connected": m4l_connected,
-        "m4l_sockets_ready": m4l_sockets_ready,
+        **connections,
         "store_counts": {
             "snapshots": len(state.snapshot_store),
             "macros": len(state.macro_store),
@@ -152,9 +124,11 @@ def start_dashboard_server():
     import uvicorn
 
     async def dashboard_page(request):
+        """Serve the embedded dashboard application."""
         return HTMLResponse(DASHBOARD_HTML)
 
     async def api_status(request):
+        """Serve the dashboard's current JSON status snapshot."""
         return JSONResponse(build_status_json())
 
     app = Starlette(routes=[
@@ -169,21 +143,70 @@ def start_dashboard_server():
         log_level="warning",
         access_log=False,
     )
-    state.dashboard_server = uvicorn.Server(config)
+    server = uvicorn.Server(config)
+    state.dashboard_server = server
 
     def _run():
+        """Run Uvicorn on a dedicated event loop and clear exited state."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(state.dashboard_server.serve())
+        try:
+            loop.run_until_complete(server.serve())
+        finally:
+            loop.close()
+            if state.dashboard_server is server:
+                state.dashboard_server = None
+            if state.dashboard_thread is threading.current_thread():
+                state.dashboard_thread = None
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard-http")
-    thread.start()
+    state.dashboard_thread = thread
+    try:
+        thread.start()
+    except Exception:
+        server.should_exit = True
+        if state.dashboard_server is server:
+            state.dashboard_server = None
+        if state.dashboard_thread is thread:
+            state.dashboard_thread = None
+        raise
     logger.info("Dashboard started at http://127.0.0.1:%d", state.DASHBOARD_PORT)
 
 
-def stop_dashboard_server():
-    """Signal the dashboard server to shut down."""
-    if state.dashboard_server:
-        state.dashboard_server.should_exit = True
+def stop_dashboard_server() -> bool:
+    """Signal shutdown and report whether the dashboard thread has exited."""
+    server = state.dashboard_server
+    thread = state.dashboard_thread
+    if server:
+        server.should_exit = True
+    stopped = True
+    if thread is threading.current_thread():
+        stopped = False
+    elif thread:
+        # Teardown may overlap the narrow window after the thread is
+        # published to shared state but before start() runs.  join() raises
+        # RuntimeError for an unstarted thread, so keep cleanup best-effort.
+        if thread.ident is None:
+            stopped = False
+        else:
+            try:
+                thread.join(timeout=3.0)
+            except RuntimeError as exc:
+                logger.warning("Could not join dashboard thread: %s", exc)
+                stopped = False
+            else:
+                stopped = not thread.is_alive()
+
+    if not stopped:
+        logger.warning(
+            "Dashboard shutdown is incomplete; retaining server and thread state"
+        )
+        return False
+
+    if state.dashboard_server is server:
         state.dashboard_server = None
+    if state.dashboard_thread is thread:
+        state.dashboard_thread = None
+    if server or thread:
         logger.info("Dashboard server stopped")
+    return True

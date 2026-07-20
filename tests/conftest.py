@@ -28,6 +28,8 @@ def reset_state():
     """Reset global state between tests."""
     original_ableton = state.ableton_connection
     original_m4l = state.m4l_connection
+    original_m4l_ping_cache = state.m4l_ping_cache.copy()
+    original_m4l_status_snapshot = state.m4l_status_snapshot
     original_snapshots = state.snapshot_store.copy()
     original_macros = state.macro_store.copy()
     original_param_maps = state.param_map_store.copy()
@@ -35,6 +37,8 @@ def reset_state():
     yield
     state.ableton_connection = original_ableton
     state.m4l_connection = original_m4l
+    state.m4l_ping_cache = original_m4l_ping_cache
+    state.m4l_status_snapshot = original_m4l_status_snapshot
     state.snapshot_store = original_snapshots
     state.macro_store = original_macros
     state.param_map_store = original_param_maps

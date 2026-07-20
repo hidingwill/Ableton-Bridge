@@ -1,8 +1,9 @@
 """AbletonConnection — TCP socket connection to the Ableton Remote Script."""
 
-import socket
 import json
 import logging
+import select
+import socket
 import time
 import threading
 from dataclasses import dataclass
@@ -24,6 +25,10 @@ NON_IDEMPOTENT_COMMANDS = frozenset([
 ])
 
 
+class CommandCancelled(RuntimeError):
+    """Raised when cooperative shutdown cancels an in-flight command."""
+
+
 @dataclass
 class AbletonConnection:
     host: str
@@ -35,6 +40,7 @@ class AbletonConnection:
     def connect(self) -> bool:
         """Connect to the Ableton Remote Script socket server"""
         if self.sock:
+            self._last_socket_open = True
             return True
 
         try:
@@ -42,6 +48,7 @@ class AbletonConnection:
             self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
             self._recv_buffer = ""  # Clear buffer on new connection
+            self._last_socket_open = True
             logger.info("Connected to Ableton at %s:%s", self.host, self.port)
             return True
         except Exception as e:
@@ -52,6 +59,7 @@ class AbletonConnection:
                 except Exception:
                     pass
             self.sock = None
+            self._last_socket_open = False
             return False
 
     def disconnect(self):
@@ -63,6 +71,7 @@ class AbletonConnection:
                 logger.error("Error disconnecting from Ableton: %s", e)
             finally:
                 self.sock = None
+                self._last_socket_open = False
         if self._udp_sock:
             try:
                 self._udp_sock.close()
@@ -72,8 +81,48 @@ class AbletonConnection:
                 self._udp_sock = None
 
     def __post_init__(self):
+        """Initialize per-connection receive buffering and send serialization."""
         self._recv_buffer = ""
         self._send_lock = threading.Lock()
+        self._last_socket_open = self.sock is not None
+
+    def is_connected(self) -> bool:
+        """Passively check whether the Remote Script socket is still open.
+
+        The check never sends or consumes protocol data. If a command currently
+        owns the send lock, return the last verified socket result so a status
+        request cannot interfere with its response handling.
+        """
+        sock = self.sock
+        if sock is None:
+            self._last_socket_open = False
+            return False
+
+        try:
+            sock.getpeername()
+        except OSError:
+            self._last_socket_open = False
+            return False
+
+        if not self._send_lock.acquire(blocking=False):
+            return self._last_socket_open
+
+        try:
+            readable, _writable, _exceptional = select.select([sock], [], [], 0)
+            if not readable:
+                self._last_socket_open = True
+                return True
+            try:
+                self._last_socket_open = bool(sock.recv(1, socket.MSG_PEEK))
+            except (BlockingIOError, socket.timeout):
+                self._last_socket_open = True
+            except OSError:
+                self._last_socket_open = False
+        except (OSError, ValueError):
+            self._last_socket_open = False
+        finally:
+            self._send_lock.release()
+        return self._last_socket_open
 
     def _ensure_udp_socket(self):
         """Create a UDP socket for real-time parameter sending if not already open."""
@@ -95,12 +144,22 @@ class AbletonConnection:
         sock.sendto(payload, (self.host, self._udp_port))
         logger.debug("Sent UDP command: %s", command_type)
 
-    def receive_full_response(self, sock, buffer_size=8192, timeout=15.0):
+    def receive_full_response(
+        self,
+        sock,
+        buffer_size=8192,
+        timeout=15.0,
+        stop_event: Optional[threading.Event] = None,
+    ):
         """Receive a complete newline-delimited JSON response and return the parsed object"""
-        sock.settimeout(timeout)
+        deadline = time.monotonic() + timeout
+        sock.settimeout(min(timeout, 0.25) if stop_event is not None else timeout)
 
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise CommandCancelled("Ableton command cancelled during shutdown")
+
                 # Check if we already have a complete line in the buffer
                 if '\n' in self._recv_buffer:
                     line, self._recv_buffer = self._recv_buffer.split('\n', 1)
@@ -115,18 +174,30 @@ class AbletonConnection:
                         return result
 
                 try:
+                    if stop_event is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise socket.timeout()
+                        sock.settimeout(min(0.25, remaining))
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         raise Exception("Connection closed before receiving any data")
 
                     self._recv_buffer += chunk.decode('utf-8')
                 except socket.timeout:
+                    if stop_event is not None:
+                        if stop_event.is_set():
+                            raise CommandCancelled(
+                                "Ableton command cancelled during shutdown"
+                            ) from None
+                        if time.monotonic() < deadline:
+                            continue
                     logger.warning("Socket timeout during receive")
                     raise
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                     logger.error("Socket connection error during receive: %s", e)
                     raise
-        except (socket.timeout, json.JSONDecodeError):
+        except (socket.timeout, json.JSONDecodeError, CommandCancelled):
             raise
         except Exception as e:
             logger.error("Error during receive: %s", e)
@@ -139,7 +210,13 @@ class AbletonConnection:
         self._recv_buffer = ""
         return self.connect()
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def send_command(
+        self,
+        command_type: str,
+        params: Dict[str, Any] = None,
+        timeout: Optional[float] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
         """Send a command to Ableton and return the response.
 
         Includes automatic retry: if the first attempt fails due to a
@@ -165,8 +242,13 @@ class AbletonConnection:
 
         for attempt in range(1, max_attempts + 1):
             with self._send_lock:
+                if stop_event is not None and stop_event.is_set():
+                    raise CommandCancelled("Ableton command cancelled during shutdown")
                 if not self.sock and not self.connect():
                     raise ConnectionError("Not connected to Ableton")
+                if stop_event is not None and stop_event.is_set():
+                    self.disconnect()
+                    raise CommandCancelled("Ableton command cancelled during shutdown")
 
                 command = {
                     "type": command_type,
@@ -181,7 +263,13 @@ class AbletonConnection:
 
                     # Pre-delay: give Ableton time to process before we read the response
                     if pre_delay:
-                        time.sleep(pre_delay)
+                        if stop_event is not None:
+                            if stop_event.wait(pre_delay):
+                                raise CommandCancelled(
+                                    "Ableton command cancelled during shutdown"
+                                )
+                        else:
+                            time.sleep(pre_delay)
 
                     # Set timeout based on command type (caller override takes priority)
                     if timeout is None:
@@ -190,7 +278,11 @@ class AbletonConnection:
                             command_type, 15.0 if is_modifying else 10.0
                         )
                     # Receive the response (already parsed by receive_full_response)
-                    response = self.receive_full_response(self.sock, timeout=timeout)
+                    response = self.receive_full_response(
+                        self.sock,
+                        timeout=timeout,
+                        stop_event=stop_event,
+                    )
                     logger.debug("Response status: %s", response.get('status', 'unknown'))
 
                     if response.get("status") == "error":
@@ -199,10 +291,20 @@ class AbletonConnection:
 
                     # Post-delay: let Ableton settle before the next command
                     if post_delay:
-                        time.sleep(post_delay)
+                        if stop_event is not None:
+                            if stop_event.wait(post_delay):
+                                raise CommandCancelled(
+                                    "Ableton command cancelled during shutdown"
+                                )
+                        else:
+                            time.sleep(post_delay)
 
                     return response.get("result", {})
 
+                except CommandCancelled:
+                    self.disconnect()
+                    self._recv_buffer = ""
+                    raise
                 except Exception as e:
                     logger.error("Command '%s' attempt %d failed: %s", command_type, attempt, e)
                     # Close the broken socket and clear buffer
@@ -211,12 +313,20 @@ class AbletonConnection:
 
                     if attempt < max_attempts:
                         # Wait briefly then retry with a fresh connection
-                        time.sleep(0.1)
+                        if stop_event is not None:
+                            if stop_event.wait(0.1):
+                                raise CommandCancelled(
+                                    "Ableton command cancelled during shutdown"
+                                ) from None
+                        else:
+                            time.sleep(0.1)
                         if not self.connect():
-                            raise ConnectionError("Failed to reconnect to Ableton")
+                            raise ConnectionError("Failed to reconnect to Ableton") from e
                         logger.info("Reconnected, retrying command...")
                     else:
-                        raise Exception(f"Command '{command_type}' failed after {max_attempts} attempts: {e}")
+                        raise Exception(
+                            f"Command '{command_type}' failed after {max_attempts} attempts: {e}"
+                        ) from e
 
 
 def get_ableton_connection():
@@ -224,11 +334,9 @@ def get_ableton_connection():
 
     if state.ableton_connection is not None:
         try:
-            # Test if the socket is still connected
-            if state.ableton_connection.sock is None:
-                raise ConnectionError("Socket is None")
-            state.ableton_connection.sock.settimeout(1.0)
-            state.ableton_connection.sock.getpeername()  # raises if disconnected
+            if not state.ableton_connection.is_connected():
+                raise ConnectionError("Socket is no longer connected")
+            state.ableton_connected_event.set()
             return state.ableton_connection
         except Exception as e:
             logger.warning("Existing connection is no longer valid: %s", e)
