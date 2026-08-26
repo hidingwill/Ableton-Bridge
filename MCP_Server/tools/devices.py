@@ -783,7 +783,8 @@ def register_tools(mcp):
 
     @mcp.tool()
     @_tool_handler("loading instrument")
-    def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
+    def load_instrument_or_effect(ctx: Context, track_index: int, uri: str,
+                                  track_type: str = "track") -> str:
         """
         Load an instrument or effect onto a track using its URI or device name.
 
@@ -812,11 +813,14 @@ def register_tools(mcp):
         For presets or third-party items, use search_browser() to find the full URI.
         """
         _validate_index(track_index, "track_index")
+        if track_type not in ("track", "return", "master"):
+            return "Error: track_type must be 'track', 'return', or 'master'"
         uri = resolve_device_uri(uri)
         ableton = get_ableton_connection()
         result = ableton.send_command("load_browser_item", {
             "track_index": track_index,
-            "item_uri": uri
+            "item_uri": uri,
+            "track_type": track_type
         })
 
         # Check if the instrument was loaded successfully
