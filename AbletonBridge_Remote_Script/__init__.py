@@ -337,7 +337,7 @@ _MODIFYING_HANDLERS = {
         p.get("enabled", True), track_type=p.get("track_type", "track"), ctrl=ctrl),
 
     # --- Browser ---
-    "load_browser_item": lambda song, p, ctrl: handlers.browser.load_browser_item(song, p.get("track_index", 0), p.get("item_uri", ""), ctrl),
+    "load_browser_item": lambda song, p, ctrl: handlers.browser.load_browser_item(song, p.get("track_index", 0), p.get("item_uri", ""), ctrl, p.get("track_type", "track")),
     "load_instrument_or_effect": lambda song, p, ctrl: handlers.browser.load_instrument_or_effect(song, p.get("track_index", 0), p.get("uri", ""), ctrl),
     "load_sample": lambda song, p, ctrl: handlers.browser.load_sample(song, p.get("track_index", 0), p.get("sample_uri", ""), ctrl),
     "preview_browser_item": lambda song, p, ctrl: handlers.browser.preview_browser_item(song, p.get("uri"), p.get("action", "preview"), ctrl),

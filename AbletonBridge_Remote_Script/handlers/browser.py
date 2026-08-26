@@ -162,10 +162,10 @@ def get_browser_item(song, uri, path, ctrl=None):
         raise
 
 
-def load_browser_item(song, track_index, item_uri, ctrl=None):
-    """Load a browser item onto a track by URI."""
+def load_browser_item(song, track_index, item_uri, ctrl=None, track_type="track"):
+    """Load a browser item onto a track by URI. track_type: "track" | "return" | "master"."""
     try:
-        track = get_track(song, track_index)
+        track = get_track(song, track_index, track_type)
         if ctrl is None:
             raise RuntimeError("load_browser_item requires ctrl for application()")
         app = ctrl.application()
